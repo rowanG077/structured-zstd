@@ -1,6 +1,9 @@
 extern crate std;
 
 use super::{DictionaryHandle, FrameDecoder};
+use crate::decoding::errors::{
+    DecodeBlockContentError, DecompressBlockError, ExecuteSequencesError, FrameDecoderError,
+};
 use crate::encoding::{CompressionLevel, FrameCompressor};
 use alloc::vec::Vec;
 
@@ -3422,4 +3425,151 @@ fn resume_does_not_redecode_prefix_blocks() {
         nblocks - n,
         "resume must decode only in-range blocks, not re-decode the prefix"
     );
+}
+
+/// The lookahead arm decodes the same bytes as the straight loop.
+///
+/// A block takes that arm when it has enough sequences to amortise the prefill
+/// and drain AND the dictionary is cold, which is the first block after an
+/// attach. Nothing else in the suite arranged both at once, so the arm went
+/// untested; it is also where the fuzzer found a zero offset, the straight
+/// loop's own resolve never producing one. Decode a dictionary frame big enough
+/// to clear the sequence threshold and check it against the payload.
+#[test]
+fn the_lookahead_arm_decodes_what_the_straight_loop_does() {
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+
+    let dict_id = 0x4C4F_4F4Bu32;
+    let mut dict_content = Vec::with_capacity(4096);
+    let mut s = 0x9E37_79B9u32;
+    while dict_content.len() < 4096 {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        dict_content.push((s >> 24) as u8);
+    }
+
+    let enc_dict =
+        Dictionary::from_raw_content(dict_id, dict_content.clone()).expect("encoder dict builds");
+    let dec_handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(dict_id, dict_content.clone()).expect("decoder dict builds"),
+    );
+
+    // Short fragments of the dictionary, separated by bytes that cannot match:
+    // many small matches rather than a few long ones, which is what clears the
+    // arm's sequence threshold.
+    let mut payload = Vec::with_capacity(64 * 1024);
+    while payload.len() < 64 * 1024 {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let at = (s >> 8) as usize % (dict_content.len() - 64);
+        let len = 8 + (s >> 28) as usize % 24;
+        payload.extend_from_slice(&dict_content[at..at + len]);
+        payload.push((s >> 16) as u8);
+    }
+
+    let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(12));
+    cctx.set_dictionary(enc_dict).expect("attach dict");
+    let frame = cctx.compress_independent_frame(&payload);
+
+    let mut decoded = alloc::vec![0u8; payload.len()];
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
+        .decode_all_with_dict_handle(frame.as_slice(), &mut decoded, &dec_handle)
+        .expect("a dictionary frame decodes");
+    assert_eq!(written, payload.len());
+    assert_eq!(
+        decoded, payload,
+        "the lookahead arm must reconstruct the payload byte for byte"
+    );
+}
+
+/// A corrupted sequence stream ends in an error, never a panic.
+///
+/// The sequence loop's exits for a stream that does not end where it said it
+/// would (bits left over, or too few for the count it declared) are reachable
+/// only from malformed input, so nothing but the fuzzer was exercising them.
+/// Flipping bytes through the tail of a real frame drives them from the
+/// ordinary suite.
+#[test]
+fn a_corrupted_sequence_stream_errors_rather_than_panics() {
+    let payload: Vec<u8> = (0..16384u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    // The sequence section is the tail of the block, so mutating bytes from the
+    // end walks through it; every byte value is tried at a few positions.
+    for back in 5..40usize {
+        if back >= compressed.len() {
+            break;
+        }
+        let pos = compressed.len() - back;
+        for delta in [1u8, 0x5A, 0xFF] {
+            let mut frame = compressed.clone();
+            frame[pos] = frame[pos].wrapping_add(delta);
+
+            let mut out = alloc::vec![0u8; payload.len() + 4096];
+            let mut decoder = FrameDecoder::new();
+            // Any outcome but a panic is acceptable: the frame may still decode
+            // (a checksum-free frame can absorb some edits), or be refused.
+            let _ = decoder.decode_all(frame.as_slice(), &mut out);
+        }
+    }
+}
+
+/// A sequence whose resolved offset is zero must be refused, not executed.
+///
+/// Zero is not a valid match offset, and a decoder that lets one through takes
+/// the match source to be the write position itself, turning corrupt input into
+/// silent garbage instead of an error. It is reachable: this frame comes from
+/// the fuzzer, which found it on the lookahead arm, where offsets are resolved
+/// by `do_offset_history` rather than the fused branchy resolve, and where the
+/// history can hand back a zero.
+///
+/// Kept as bytes rather than only as a fuzz corpus file so the contract is
+/// checked by the ordinary test run, on every target, in both debug and release.
+#[test]
+fn a_zero_offset_sequence_is_refused_rather_than_executed() {
+    let frame: [u8; 35] = [
+        0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x73, 0xc5, 0x00, 0x00, 0x3d, 0x7a, 0x1c, 0x04, 0xc5, 0x00,
+        0x00, 0x28, 0x7e, 0x28, 0x27, 0xf5, 0xfd, 0x2e, 0x00, 0xfd, 0x2e, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x26, 0x9d, 0x00,
+    ];
+
+    // Both surfaces must REFUSE it, and for this reason: an `Ok` here is the
+    // silent garbage the guard exists to prevent, so a test that tolerated one
+    // would pass with the guard deleted and protect nothing.
+    let expect_zero_offset = |err: &FrameDecoderError| {
+        assert!(
+            matches!(
+                err,
+                FrameDecoderError::FailedToReadBlockBody(
+                    DecodeBlockContentError::DecompressBlockError(
+                        DecompressBlockError::ExecuteSequencesError(
+                            ExecuteSequencesError::ZeroOffset
+                        )
+                    )
+                ),
+            ),
+            "expected the zero-offset refusal, got {err:?}",
+        );
+    };
+
+    let mut decoder = FrameDecoder::new();
+    let mut out = alloc::vec![0u8; 1 << 16];
+    let err = decoder
+        .decode_all(frame.as_slice(), &mut out)
+        .expect_err("decode_all must refuse a zero-offset sequence");
+    expect_zero_offset(&err);
+
+    // The growing-sink surface refuses the same frame, but it can reach its own
+    // limit before the sequence executes, so only the refusal is pinned here;
+    // the cause is pinned above, on the surface that reaches the guard.
+    let mut collected = Vec::new();
+    let mut streamed = FrameDecoder::new();
+    streamed
+        .decode_all_to_vec(frame.as_slice(), &mut collected)
+        .expect_err("decode_all_to_vec must refuse the frame");
 }

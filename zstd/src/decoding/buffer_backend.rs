@@ -121,6 +121,34 @@ pub(crate) trait BufferBackend: Sized {
     /// is an error to report rather than an assert to trip.
     const FIXED_CAPACITY: bool = false;
 
+    /// `true` when the write cursor only ever moves forward, so a caller may
+    /// carry it in locals across a whole block and hand it back once.
+    ///
+    /// `false` for `RingBuffer`: its cursor wraps, and both the gate that
+    /// admits a sequence to the inline path and the commit that normalises the
+    /// wrap read the backend's own `tail`. A cursor carried past a wrap would
+    /// address the ring linearly and ask that gate a stale question, so the
+    /// ring is given its position back at every sequence instead.
+    // Read by the x86_64 AVX2 sequence loop, the only one that carries a
+    // cursor; dead on every other target, like the inline-exec hooks above.
+    #[allow(dead_code)]
+    const CURSOR_IS_BLOCK_STABLE: bool = false;
+
+    /// The highest write cursor this block may reach, with the per-block output
+    /// ceiling folded in.
+    ///
+    /// A carried cursor cannot ask [`Self::inline_exec_ok`] about the ceiling,
+    /// because that reads the backend's own live length and the backend has not
+    /// seen the writes yet. Folding the ceiling into one limit keeps the
+    /// per-sequence question a single comparison and keeps it correct: a
+    /// backend whose `cap` already accounts for the ceiling (`UserSliceBackend`)
+    /// needs no override.
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn inline_write_limit(&self) -> usize {
+        self.cap()
+    }
+
     /// Upstream zstd's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
     /// from `lit_src` at the current tail, then writes `match_length`

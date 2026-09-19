@@ -9,7 +9,7 @@
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
-use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline};
+use super::exec_sequence_inline::{exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline_at};
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
@@ -98,17 +98,10 @@ macro_rules! execute_one_body {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
             }
 
-            // Literal-source slack, which both inline paths need: their `copy16`
-            // reads 16 bytes whatever the literal length, and the wildcopy
-            // regime reads the length rounded up to its stride.
-            let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && lit_cur_before
-                    .checked_add(16)
-                    .is_some_and(|b| b <= literals_buffer_len_v)
-                && (seq_ll_v as usize <= 16
-                    || lit_cur_before
-                        .checked_add((seq_ll_v as usize).next_multiple_of(16))
-                        .is_some_and(|b| b <= literals_buffer_len_v));
+            // The literal-source slack both inline paths need is guaranteed for
+            // the whole block by the literals decoder; see the AVX2 tier for
+            // where upstream settles the same question.
+            let inline_literals_ok = B::SUPPORTS_INLINE_SEQUENCE_EXEC;
             let offset = resolved_offset_v as usize;
             let prefix_resident = $buffer
                 .len()
@@ -127,21 +120,59 @@ macro_rules! execute_one_body {
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
                     // Inline the AVX2 exec body at the call site (no trait-method
                     // call boundary; VBMI2 always implies AVX2+BMI2 so the ymm
-                    // wildcopy is in scope — see `exec_sequence_avx2_inline`).
-                    let r = exec_sequence_avx2_inline!(
-                        $buffer,
+                    // wildcopy is in scope — see `exec_sequence_avx2_inline_at`).
+                    // This tier still reads the cursor per sequence; the AVX2
+                    // tier carries it in locals across the whole block.
+                    // The write end is derived per sequence here, unlike the
+                    // AVX2 tier which carries it for a block: hoisting it needs
+                    // a carried cursor, which is only sound for a backend whose
+                    // cursor moves forward (`CURSOR_IS_BLOCK_STABLE`) and needs
+                    // the per-block ceiling folded in. This tier is behind an
+                    // off-by-default feature and cannot be measured on the
+                    // hardware this is developed against, so it keeps the shape
+                    // that asks the backend every time rather than an unmeasured
+                    // copy of the other tier's.
+                    let backend = $buffer.buffer_mut();
+                    let tail = backend.tail();
+                    // The write limit, which carries the per-block ceiling, not
+                    // the raw allocation. This tier reads the backend every
+                    // sequence, so `inline_exec_ok` above already sees a current
+                    // live length and enforces the ceiling; taking the limit
+                    // here means the copy does not depend on that being so.
+                    let cap = backend.inline_write_limit();
+                    // SAFETY: gated on `SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
+                    // backend is linear and overrides this.
+                    let base = unsafe { backend.inline_exec_base_ptr() };
+                    // Saturating is the meaning: an output shorter than the
+                    // overshoot leaves no room for an overshooting write, and an
+                    // end of zero says so, sending the sequence to the exact
+                    // copier. The gate is the comparison against this, not this.
+                    let cap_w = cap.saturating_sub(
+                        crate::decoding::exec_sequence_inline::MAX_WILDCOPY_OVERSHOOT,
+                    );
+                    let r = exec_sequence_avx2_inline_at!(
+                        base,
+                        tail,
+                        cap,
+                        cap_w,
                         lit_src,
                         seq_ll_v as usize,
                         offset,
                         seq_ml_v as usize
                     );
-                    // Inline path bypasses the wrapper's output counter; keep it
-                    // current for backends that read it (Ring/Flat). Const-folded
-                    // away for UserSliceBackend.
-                    if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
-                        $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                    if let Ok(total) = r {
+                        // SAFETY: the copy wrote exactly `total` bytes at `tail`.
+                        unsafe { $buffer.buffer_mut().inline_exec_commit(tail + total) };
+                        // Inline path bypasses the wrapper's output counter; keep
+                        // it current for backends that read it (Ring/Flat).
+                        // Const-folded away for UserSliceBackend.
+                        if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                            $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                        }
                     }
-                    break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
+                    break 'exec_inner r
+                        .map(|_| ())
+                        .map_err(DecompressBlockError::ExecuteSequencesError);
                 }
             // A match reaching past the output into reachable dictionary content
             // is one more inline copy, on the same ymm body this tier uses for
@@ -195,6 +226,8 @@ macro_rules! execute_one_body {
 /// Caller must have verified the full VBMI2 + AVX-512 + AVX2 + BMI2 set.
 #[target_feature(enable = "bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw")]
 #[allow(clippy::too_many_lines)]
+// The block's inputs; see the AVX2 tier for why they stay separate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
@@ -202,6 +235,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
     buffer: &mut DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    literals_len: usize,
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     let SeqStreamSetup {
@@ -214,7 +248,14 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
         num_sequences,
         use_long_pipeline,
     } = init_sequence_stream::<B, Vbmi2Kernel>(section, source, fse, buffer, dict)?;
-    let literals_buffer_len = literals_buffer.len();
+    // `literals_buffer` runs past the literals by the copiers' read slack, so
+    // the literal count is the parameter, never the slice's length.
+    let literals_buffer_len = literals_len;
+    debug_assert!(
+        literals_buffer.len() >= literals_len + crate::WILDCOPY_OVERLENGTH,
+        "literals view lacks the copiers' read slack: {} bytes for {literals_len} literals",
+        literals_buffer.len(),
+    );
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
     // Invariant for the whole block, so it is resolved here rather than per
@@ -390,7 +431,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<'fse, B: BufferBackend>(
     }
 
     if lit_cur < literals_buffer_len {
-        let rest = &literals_buffer[lit_cur..];
+        let rest = &literals_buffer[lit_cur..literals_buffer_len];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
         seq_sum = seq_sum.wrapping_add(rest.len() as u32);
     }

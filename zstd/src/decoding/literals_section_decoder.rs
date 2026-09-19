@@ -2,6 +2,7 @@
 //! parsed literals header and a source and decompress it.
 
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
+use super::buffer_backend::WILDCOPY_OVERLENGTH;
 use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
@@ -66,8 +67,19 @@ pub fn decode_literals(
 /// sections it's a borrow of the scratch `literals_buffer` where the
 /// data was materialised.
 pub struct LiteralsView<'a> {
-    /// Decoded literal bytes available for the sequence executor.
+    /// The literal bytes, followed by at least [`WILDCOPY_OVERLENGTH`] more
+    /// readable bytes WHEN THE CALLER ASKED FOR SLACK. The executor's copiers
+    /// read the literal length rounded up to their stride (and 16 bytes
+    /// whatever the length), so that slack is what lets them do it without
+    /// asking per sequence whether it is there.
+    ///
+    /// A block with no sequences runs no copiers, asks for no slack, and gets a
+    /// view that ends at the literals: an unsafe consumer must not assume the
+    /// overread room unless it passed `needs_slack`. Either way the literal
+    /// data ends at `len`, and anything past it is not literal content.
     pub data: &'a [u8],
+    /// How many of `data`'s bytes are literals. Always `<= data.len()`.
+    pub len: usize,
     /// Bytes consumed from the input literals section payload
     /// (Raw: regenerated_size; HUF: header + jump + 4 streams).
     pub bytes_used: u32,
@@ -83,11 +95,25 @@ pub struct LiteralsView<'a> {
 /// Upstream zstd parity: `dctx->litPtr` is set to either `src` (Raw) or
 /// `dctx->litBuffer` (HUF); the seq executor reads from
 /// `dctx->litPtr` uniformly.
+///
+/// `source` is the literals payload FOLLOWED BY whatever else the block holds,
+/// and `payload_len` says where the payload ends. The tail is what decides
+/// whether a Raw section can be borrowed rather than copied: borrowing is only
+/// safe when the block carries the copiers' read slack after the literals. The
+/// entropy paths never see past `payload_len`.
+/// `needs_slack` says whether a sequence executor will read these literals. A
+/// block with no sequences writes them out as they are, so it gets no padding
+/// and a Raw section stays borrowed however little follows it in the block.
+// The block's literals inputs, each a borrow or a scalar the caller already
+// holds; a struct here would marshal a record per block to satisfy the lint.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_literals_zerocopy<'a>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
     source: &'a [u8],
+    payload_len: usize,
+    needs_slack: bool,
     target: &'a mut Vec<u8>,
     kernel: CpuKernelTag,
 ) -> Result<LiteralsView<'a>, DecompressLiteralsError> {
@@ -112,13 +138,27 @@ pub fn decode_literals_zerocopy<'a>(
                     needed: n,
                 });
             }
-            // Zero-copy: borrow the payload from source. `target` is
-            // left untouched — the caller passes `LiteralsView::data`
-            // to the sequence executor instead.
-            Ok(LiteralsView {
-                data: &source[0..n],
-                bytes_used: section.regenerated_size,
-            })
+            // Borrow the payload from the input when the block carries enough
+            // bytes after it for the copiers' slack, exactly as upstream
+            // decides between `dctx->litPtr = istart + lhSize` and a copy into
+            // `dctx->litBuffer` (zstd_decompress_block.c:275-295). Asked once
+            // per block here, the executor never asks again. With no sequences
+            // to run there is nothing to give slack to, so the borrow stands
+            // whatever follows the payload.
+            if !needs_slack || source.len() >= n + WILDCOPY_OVERLENGTH {
+                let end = if needs_slack {
+                    n + WILDCOPY_OVERLENGTH
+                } else {
+                    n
+                };
+                return Ok(LiteralsView {
+                    data: &source[..end],
+                    len: n,
+                    bytes_used: section.regenerated_size,
+                });
+            }
+            target.extend_from_slice(&source[..n]);
+            pad_with_slack(target, base, n, bytes_used_raw(section), needs_slack)
         }
         LiteralsSectionType::RLE => {
             // RLE expands one byte to N — has to write into target.
@@ -126,20 +166,43 @@ pub fn decode_literals_zerocopy<'a>(
             if source.is_empty() {
                 return Err(DecompressLiteralsError::MissingBytesForLiterals { got: 0, needed: 1 });
             }
-            target.resize(base + section.regenerated_size as usize, source[0]);
-            Ok(LiteralsView {
-                data: &target[base..],
-                bytes_used: 1,
-            })
+            let n = section.regenerated_size as usize;
+            target.resize(base + n, source[0]);
+            pad_with_slack(target, base, n, 1, needs_slack)
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-            let bytes_used = decompress_literals(section, scratch, dict, source, target, kernel)?;
-            Ok(LiteralsView {
-                data: &target[base..],
-                bytes_used,
-            })
+            let payload = &source[..payload_len.min(source.len())];
+            let bytes_used = decompress_literals(section, scratch, dict, payload, target, kernel)?;
+            let n = target.len() - base;
+            pad_with_slack(target, base, n, bytes_used, needs_slack)
         }
     }
+}
+
+/// Bytes a Raw section consumes from the payload: the literals themselves.
+fn bytes_used_raw(section: &LiteralsSection) -> u32 {
+    section.regenerated_size
+}
+
+/// Append the copiers' read slack after `n` literals at `base` and return the
+/// view over both. The slack is written, not merely reserved: the copiers read
+/// it, and reading uninitialised memory is undefined behaviour here even though
+/// the bytes are discarded.
+fn pad_with_slack(
+    target: &mut Vec<u8>,
+    base: usize,
+    n: usize,
+    bytes_used: u32,
+    needs_slack: bool,
+) -> Result<LiteralsView<'_>, DecompressLiteralsError> {
+    if needs_slack {
+        target.resize(base + n + WILDCOPY_OVERLENGTH, 0);
+    }
+    Ok(LiteralsView {
+        data: &target[base..],
+        len: n,
+        bytes_used,
+    })
 }
 
 /// Decompress the provided literals section and source into the provided `target`.

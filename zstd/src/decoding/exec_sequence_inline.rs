@@ -26,6 +26,16 @@
 //! See the [`portable`] module doc for how the inline path is reached
 //! per target.
 
+/// Most bytes a wildcopy body may write past the sequence it was asked for: its
+/// widest stride less one. A destination with at least this much room after the
+/// write can take the overshooting copiers; anything tighter takes the exact one.
+///
+/// Gated to the tier that reads it (the AVX2 sequence loop, which keeps the
+/// output end less this value in its cursor), so the builds without that tier
+/// do not carry an unused constant.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+pub(crate) const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+
 /// Exact, non-overshooting literal+match copy of one sequence at
 /// `base[tail..]` — the cold-path twin of the SIMD wildcopy bodies. Every
 /// inline-exec site (the per-kernel macros below and
@@ -58,111 +68,124 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
             // No overlap: source range ends before destination starts.
             core::ptr::copy_nonoverlapping(match_src, op_match, match_length);
         } else {
-            // Overlapping LZ copy: forward byte-by-byte replicates the
-            // `offset`-periodic pattern (upstream zstd `ZSTD_overlapCopy`, scalar form).
-            let mut i = 0usize;
-            while i < match_length {
-                *op_match.add(i) = *match_src.add(i);
-                i += 1;
+            // Overlapping LZ copy. The match repeats a period of `offset`
+            // bytes, so copy that period once and then double what is already
+            // written: every step is a non-overlapping block copy, and the
+            // block doubles each time, so even a period of one byte fills the
+            // match in block moves rather than one byte at a time. Upstream
+            // reaches the same place differently (`ZSTD_overlapCopy8` spreads
+            // the period to eight and its wildcopy takes it from there,
+            // zstd_decompress_block.c:804-824); what matters is that neither
+            // walks the match byte by byte, which on a long match with a short
+            // offset costs a factor.
+            let period = offset.min(match_length);
+            core::ptr::copy_nonoverlapping(match_src, op_match, period);
+            let mut filled = period;
+            while filled < match_length {
+                let chunk = filled.min(match_length - filled);
+                core::ptr::copy_nonoverlapping(op_match.cast_const(), op_match.add(filled), chunk);
+                filled += chunk;
             }
         }
     }
 }
 
-/// Textual expansion of the AVX2 `ZSTD_execSequence` body at the call
-/// site, fusing the match-copy into a per-tier sequence monolith. A
-/// `#[target_feature(avx2)]` function cannot be `#[inline(always)]`
-/// (rust#145574), so the [`BufferBackend::exec_sequence_inline_avx2`]
-/// trait method stays a real CALL on the hot path; expanding the body via
-/// a macro removes that boundary (the reference `decompressSequences_bmi2`
-/// is one inlined monolith). Backend access goes through the inlinable
-/// accessors `cap` / `tail` / `inline_exec_base_ptr` / `inline_exec_commit`,
-/// so the macro stays generic over `B` while only the linear inline
-/// backends (`UserSliceBackend`, `FlatBuf`) ever reach it (gated on
-/// `SUPPORTS_INLINE_SEQUENCE_EXEC`). 32-byte ymm match-copy for
-/// `offset >= 32`; usable from any tier whose enclosing fn carries
-/// `target_feature(avx2,bmi2)` (AVX2 and VBMI2). The trait method
-/// `exec_sequence_inline_avx2` remains the unit-tested reference spec for
-/// this body. Returns `Result<(), ExecuteSequencesError>`.
+/// Textual expansion of the AVX2 `ZSTD_execSequence` body at the call site,
+/// fusing the match-copy into a per-tier sequence monolith, addressed by an
+/// explicit cursor rather than by asking the backend where it is.
+///
+/// A `#[target_feature(avx2)]` function cannot be `#[inline(always)]`
+/// (rust#145574), so the [`BufferBackend::exec_sequence_inline_avx2`] trait
+/// method stays a real CALL on the hot path; expanding the body via a macro
+/// removes that boundary (the reference `decompressSequences_bmi2` is one
+/// inlined monolith). The trait method remains the unit-tested reference spec
+/// for this body. 32-byte ymm match-copy for `offset >= 32`; usable from any
+/// tier whose enclosing fn carries `target_feature(avx2,bmi2)` (AVX2 and VBMI2).
+///
+/// Taking the cursor as arguments is what lets the AVX2 tier keep its write
+/// position in locals for a whole block; the VBMI2 tier reads one per sequence
+/// and passes it here, so both share this body. Returns the bytes written, so
+/// the caller can advance whichever of the two it holds.
 //
 // Gated on `kernel-avx2` (implied by `kernel-vbmi2`) so the macro is absent
 // when its only consumers (`seq_decoder_avx2` / `seq_decoder_vbmi2`) are
 // compiled out — otherwise the `--no-default-features` build sees an unused
 // macro and trips `-D warnings`.
+///
+/// # Safety
+/// The enclosing function must carry `target_feature(bmi2,avx2)`, `base` must be
+/// the start of a linear output valid for writes through `cap`, and `lit_src`
+/// must be readable for the literal length rounded up to 16.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-macro_rules! exec_sequence_avx2_inline {
-    ($buffer:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
+macro_rules! exec_sequence_avx2_inline_at {
+    ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
             wildcopy_overlap_8byte_stride,
         };
-        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
         let lit_length_v: usize = $lit_length;
         let offset_v: usize = $offset;
         let match_length_v: usize = $match_length;
         let lit_src_v: *const u8 = $lit_src;
-        let backend = $buffer.buffer_mut();
-        let cap = backend.cap();
-        let tail = backend.tail();
-        // Hard guard with `overshoot = 0`; the <=31-byte wildcopy slack is
-        // handled by the tight-tail branch below so an exact-fit output
-        // slice (no `WILDCOPY_OVERLENGTH` trailing room) stays correct.
-        match sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0) {
-            Err(e) => Err(e),
-            Ok(total) => {
-                // SAFETY: the enclosing fn carries
-                // `#[target_feature(enable = "...,bmi2,avx2")]`; the inline
-                // path is gated on `B::SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
-                // backend is linear and overrides `inline_exec_base_ptr` /
-                // `inline_exec_commit`. `sequence_output_fits` validated
-                // `tail + total <= cap`.
+        let base: *mut u8 = $base;
+        let cap: usize = $cap;
+        let cap_w: usize = $cap_w;
+        let tail: usize = $tail;
+        // One comparison decides the hot path, exactly as upstream's
+        // `oMatchEnd > oend_w`: `cap_w` is the end with the overshoot already
+        // taken off, computed once per block. Both lengths are bounded by a
+        // block's FSE expansion, so the sum cannot overflow. Everything else,
+        // including whether the write fits at all, belongs to the branch that
+        // is almost never taken.
+        let total = lit_length_v + match_length_v;
+        if tail + total > cap_w {
+            sequence_output_fits(lit_length_v, match_length_v, tail, cap, 0).map(|total| {
+                // Tight tail: the write fits but the overshoot would not.
+                // SAFETY: as below, with the exact copy in place of the
+                // overshooting one.
                 unsafe {
-                    let base = backend.inline_exec_base_ptr();
-                    if total + MAX_WILDCOPY_OVERSHOOT > cap - tail {
-                        // Tight tail: literal+match fit exactly but the
-                        // wildcopy overshoot would write past `cap`. Shared
-                        // exact, non-overshooting copy.
-                        $crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
-                            base,
-                            tail,
-                            lit_src_v,
-                            lit_length_v,
-                            offset_v,
-                            match_length_v,
-                        );
-                    } else {
-                        let op_lit = base.add(tail);
-                        let op_match = base.add(tail + lit_length_v);
-                        let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
-                        copy16(op_lit, lit_src_v);
-                        if lit_length_v > 16 {
-                            wildcopy_no_overlap(
-                                op_lit.add(16),
-                                lit_src_v.add(16),
-                                lit_length_v - 16,
-                            );
-                        }
-                        if offset_v >= 32 {
-                            wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
-                        } else if offset_v >= 16 {
-                            wildcopy_no_overlap(op_match, match_src, match_length_v);
-                        } else {
-                            let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
-                            if match_length_v > 8 {
-                                wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
-                            }
-                        }
-                    }
-                    backend.inline_exec_commit(tail + total);
+                    $crate::decoding::exec_sequence_inline::exec_sequence_bounded_copy(
+                        base,
+                        tail,
+                        lit_src_v,
+                        lit_length_v,
+                        offset_v,
+                        match_length_v,
+                    );
                 }
-                Ok(())
+                total
+            })
+        } else {
+            // SAFETY: the enclosing fn carries
+            // `#[target_feature(enable = "...,bmi2,avx2")]`, the caller vouches
+            // for `base`, and the comparison above established room for the
+            // write and for every byte the wildcopy may overshoot.
+            unsafe {
+                let op_lit = base.add(tail);
+                let op_match = base.add(tail + lit_length_v);
+                let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
+                copy16(op_lit, lit_src_v);
+                if lit_length_v > 16 {
+                    wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                }
+                if offset_v >= 32 {
+                    wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
+                } else if offset_v >= 16 {
+                    wildcopy_no_overlap(op_match, match_src, match_length_v);
+                } else {
+                    let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
+                    if match_length_v > 8 {
+                        wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
+                    }
+                }
             }
+            Ok(total)
         }
     }};
 }
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
-pub(crate) use exec_sequence_avx2_inline;
+pub(crate) use exec_sequence_avx2_inline_at;
 
 /// AVX2-tier body for a sequence whose match lies wholly inside dictionary
 /// content, as selected by

@@ -436,8 +436,22 @@ impl BlockDecoder {
             });
         }
 
-        let raw_literals = &raw[..upper_limit_for_literals];
-        vprintln!("Slice for literals: {}", raw_literals.len());
+        // The literals payload plus whatever the block holds after it. The
+        // decoder reads literals only within `upper_limit_for_literals`; the
+        // tail decides whether a Raw section can be borrowed instead of copied,
+        // which is what buys the executor its read slack for free.
+        let raw_literals = raw;
+        vprintln!("Slice for literals: {}", upper_limit_for_literals);
+
+        // The sequence header sits immediately after the literals payload, so
+        // its count is readable before the literals are decoded. Read it here:
+        // whether the copiers will run at all decides whether the literals need
+        // the read slack, and a literals-only block should not be copied into
+        // scratch to provide slack nothing will use.
+        let mut seq_section = SequencesHeader::new();
+        let bytes_in_sequence_header =
+            seq_section.parse_from_header(&raw[upper_limit_for_literals..])?;
+        let sequences_will_run = seq_section.num_sequences != 0;
 
         literals_buffer.clear(); //all literals of the previous block must have been used in the sequence execution anyways. just be defensive here
         // Zero-copy literals view — for Raw sections this borrows
@@ -449,19 +463,21 @@ impl BlockDecoder {
         // flamegraph.
         let LiteralsView {
             data: literals_view,
+            len: literals_len,
             bytes_used: bytes_used_in_literals_section,
         } = decode_literals_zerocopy(
             &section,
             huf,
             dict,
             raw_literals,
+            upper_limit_for_literals,
+            sequences_will_run,
             literals_buffer,
             self.kernel,
         )?;
         assert!(
-            section.regenerated_size as usize == literals_view.len(),
-            "Wrong number of literals: {}, Should have been: {}",
-            literals_view.len(),
+            section.regenerated_size as usize == literals_len,
+            "Wrong number of literals: {literals_len}, Should have been: {}",
             section.regenerated_size
         );
         assert!(bytes_used_in_literals_section == upper_limit_for_literals as u32);
@@ -469,8 +485,6 @@ impl BlockDecoder {
         let raw = &raw[upper_limit_for_literals..];
         vprintln!("Slice for sequences with headers: {}", raw.len());
 
-        let mut seq_section = SequencesHeader::new();
-        let bytes_in_sequence_header = seq_section.parse_from_header(raw)?;
         let raw = &raw[bytes_in_sequence_header as usize..];
         vprintln!(
             "Found sequencessection with sequences: {} and size: {}",
@@ -520,6 +534,7 @@ impl BlockDecoder {
                 buffer,
                 offset_hist,
                 literals_view,
+                literals_len,
                 dict,
                 self.kernel,
             )?;
@@ -538,7 +553,7 @@ impl BlockDecoder {
             // write's error path through this body cost 9.9% of cycles on a
             // 1 MiB level-19 stream while issuing 0.6% FEWER instructions: the
             // sequence executor it calls is laid out around this body.
-            return write_literals_only(buffer, literals_view);
+            return write_literals_only(buffer, &literals_view[..literals_len]);
         }
 
         // Nothing drains the buffer inside a block, so the growth of its live

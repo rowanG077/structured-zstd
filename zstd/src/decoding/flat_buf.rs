@@ -89,6 +89,25 @@ impl BufferBackend for FlatBuf {
     /// every target.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
+    /// A flat buffer's cursor only moves forward, so a sequence loop may carry
+    /// it for a whole block.
+    const CURSOR_IS_BLOCK_STABLE: bool = true;
+
+    /// `cap()` here is the allocation, and the per-block ceiling is a separate
+    /// bound on the LIVE output, so fold it in: the ceiling allows
+    /// `len() + written <= max_capacity`, which is `tail + written <= head +
+    /// max_capacity`. A carried cursor then meets both bounds in the one
+    /// comparison it already makes, without asking a backend that has not seen
+    /// its writes yet.
+    ///
+    /// The saturating add is the meaning, not a guard: between blocks
+    /// `max_capacity` is `usize::MAX`, which says "no ceiling", and saturating
+    /// turns that into a limit of `usize::MAX` so the allocation bound decides.
+    #[inline(always)]
+    fn inline_write_limit(&self) -> usize {
+        self.cap().min(self.head.saturating_add(self.max_capacity))
+    }
+
     /// A linear buffer is always contiguous, so what is left to answer here is
     /// the per-block output ceiling: the inline path writes without going
     /// through `try_reserve`, which is where that ceiling is otherwise enforced.
