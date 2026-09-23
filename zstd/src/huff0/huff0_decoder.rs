@@ -171,7 +171,7 @@ pub struct HuffmanTable {
     pub max_num_bits: u8,
     state_mask: u64,
     bits: Vec<u8>,
-    bit_ranks: Vec<u32>,
+    bit_ranks: [u32; (MAX_MAX_NUM_BITS as usize) + 1],
     /// Running `sum(1 << (w - 1))` accumulated WHILE weights decode
     /// (upstream zstd `HUF_readStats` keeps the same running stats), replacing a
     /// separate post-decode pass over `weights`.
@@ -194,7 +194,6 @@ impl HuffmanTable {
         self.packed_decode.capacity() * core::mem::size_of::<u16>()
             + self.weights.capacity()
             + self.bits.capacity()
-            + self.bit_ranks.capacity() * core::mem::size_of::<u32>()
             + self.fse_table.heap_bytes()
     }
 
@@ -207,7 +206,7 @@ impl HuffmanTable {
             max_num_bits: 0,
             state_mask: 0,
             bits: Vec::with_capacity(256),
-            bit_ranks: Vec::with_capacity(11),
+            bit_ranks: [0; (MAX_MAX_NUM_BITS as usize) + 1],
             weight_sum: 0,
             weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],
             last_weight: 0,
@@ -237,7 +236,7 @@ impl HuffmanTable {
         self.max_num_bits = 0;
         self.state_mask = 0;
         self.bits.clear();
-        self.bit_ranks.clear();
+        self.bit_ranks.fill(0);
         self.weight_sum = 0;
         self.weight_rank_count = [0; (MAX_MAX_NUM_BITS as usize) + 1];
         self.last_weight = 0;
@@ -570,8 +569,7 @@ impl HuffmanTable {
         // a weight `w > 0` maps to `bits = max_bits + 1 - w`, weight 0
         // stays code-length 0, and the inferred last symbol contributes
         // one extra entry at its derived length.
-        self.bit_ranks.clear();
-        self.bit_ranks.resize((max_bits + 1) as usize, 0);
+        self.bit_ranks.fill(0);
         self.bit_ranks[0] = self.weight_rank_count[0];
         for w in 1..=max_bits {
             self.bit_ranks[(max_bits + 1 - w) as usize] = self.weight_rank_count[w as usize];
@@ -631,8 +629,7 @@ impl HuffmanTable {
         let mut sym_off = [0usize; 16];
         let mut acc = 0usize;
         // Prefix sum of the per-code-length counts: `sym_off[l]` is the start
-        // index of the length-`l` run in `sorted`. `bit_ranks` has exactly
-        // `max_bits + 1` entries (<= 12), so zipping bounds the walk.
+        // index of the length-`l` run in `sorted`. `bit_ranks` has 12 entries; counts above `max_bits` are zero.
         for (off, &rank) in sym_off.iter_mut().zip(self.bit_ranks.iter()) {
             *off = acc;
             acc += rank as usize;
