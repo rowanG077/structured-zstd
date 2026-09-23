@@ -879,10 +879,15 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         fn field_at(source: &[u8], bit_pos: usize, n: usize) -> u64 {
             debug_assert!(n <= 32);
             let byte = bit_pos >> 3;
-            let mut window = [0u8; 8];
-            let take = source.len().saturating_sub(byte).min(8);
-            window[..take].copy_from_slice(&source[byte..byte + take]);
-            (u64::from_le_bytes(window) >> (bit_pos & 7)) & ((1u64 << n) - 1)
+            let remaining = &source[byte..];
+            let window = if let Some(bytes) = remaining.first_chunk::<8>() {
+                u64::from_le_bytes(*bytes)
+            } else {
+                let mut window = [0u8; 8];
+                window[..remaining.len()].copy_from_slice(remaining);
+                u64::from_le_bytes(window)
+            };
+            (window >> (bit_pos & 7)) & ((1u64 << n) - 1)
         }
         macro_rules! read_bits {
             ($n:expr) => {{
