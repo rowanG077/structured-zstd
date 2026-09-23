@@ -254,15 +254,6 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
     kernel: CpuKernelTag,
 ) -> Result<(), DecompressBlockError> {
-    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
-    use crate::cpu_kernel::NeonKernel;
-    #[cfg(all(
-        target_arch = "aarch64",
-        feature = "kernel-sve",
-        any(feature = "std", target_feature = "sve"),
-    ))]
-    use crate::cpu_kernel::SveKernel;
-
     // Feature detection happened once, before the first block. This is the
     // dispatch: one branch selecting the per-tier monomorph, which then runs
     // the whole sequence loop with the tier baked in.
@@ -367,7 +358,9 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
             }
         }
         #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
-        CpuKernelTag::Neon => decode_and_execute_sequences_impl::<B, NeonKernel>(
+        // NEON and SVE use the same scalar bit operations. Their copy kernels
+        // are selected by the buffer; share the optimized sequence loop.
+        CpuKernelTag::Neon => super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
             section,
             source,
             fse,
@@ -382,7 +375,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
             feature = "kernel-sve",
             any(feature = "std", target_feature = "sve"),
         ))]
-        CpuKernelTag::Sve => decode_and_execute_sequences_impl::<B, SveKernel>(
+        CpuKernelTag::Sve => super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
             section,
             source,
             fse,

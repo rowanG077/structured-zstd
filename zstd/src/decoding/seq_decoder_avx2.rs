@@ -81,202 +81,6 @@ macro_rules! decode_one_body {
     }};
 }
 
-/// Branchy offset/repcode resolution + ml/ll reads, parameterised by the
-/// bit-reader method `$rd` (`get_bits` = demand-refilled, or
-/// `get_bits_unchecked` = no per-read refill check after a prior
-/// `ensure_bits`). The control flow mirrors upstream `ZSTD_decodeSequence`:
-/// the offset extra-bit read is folded INTO the `ofBits>1 / ==0 / ==1`
-/// branches and the repcode history rotation is resolved inline. Expands to
-/// `(ll, ml, actual_offset)`; rotates `$hist` in place.
-macro_rules! cshape_resolve {
-    (
-        $rd:ident, $ll_base:expr, $ml_base:expr, $of_base:expr,
-        $ll_bits:expr, $ml_bits:expr, $of_bits:expr, $br:expr, $hist:expr
-    ) => {{
-        let ll_base = $ll_base;
-        let of_base = $of_base;
-        let ml_bits = $ml_bits;
-        let ll_bits = $ll_bits;
-        let of_bits = $of_bits;
-
-        let actual_offset: u32 = if of_bits > 1 {
-            // Real offset: read ofBits, no repcode. offBase = of_base + raw >= 4.
-            let raw = $br.$rd(of_bits) as u32;
-            let resolved = (of_base + raw).wrapping_sub(3);
-            $hist[2] = $hist[1];
-            $hist[1] = $hist[0];
-            $hist[0] = resolved;
-            resolved
-        } else {
-            let ll0 = ll_base == 0;
-            if of_bits == 0 {
-                // Repcode 0 (most common): no offset bits consumed.
-                let idx = usize::from(ll0);
-                let resolved = $hist[idx];
-                $hist[1] = $hist[idx ^ 1];
-                $hist[0] = resolved;
-                resolved
-            } else {
-                // ofBits == 1: one bit selects among rep1..rep3. The upstream
-                // repcode base for this arm is 1 (our of_base is 2 here).
-                let bit = $br.$rd(1) as u32;
-                let off_code = 1 + u32::from(ll0) + bit; // in {1,2,3}
-                let mut temp = if off_code == 3 {
-                    $hist[0].wrapping_sub(1)
-                } else {
-                    $hist[off_code as usize]
-                };
-                // 0 is not a valid offset: force corruption to surface downstream
-                // (upstream `temp -= !temp`; our executor rejects offset 0).
-                temp = temp.wrapping_sub(u32::from(temp == 0));
-                if off_code != 1 {
-                    $hist[2] = $hist[1];
-                }
-                $hist[1] = $hist[0];
-                $hist[0] = temp;
-                temp
-            }
-        };
-        debug_assert_ne!(actual_offset, 0);
-
-        // === Match length + literal length extra bits ===
-        let ml = $ml_base
-            + if ml_bits > 0 {
-                $br.$rd(ml_bits) as u32
-            } else {
-                0
-            };
-        let ll = ll_base
-            + if ll_bits > 0 {
-                $br.$rd(ll_bits) as u32
-            } else {
-                0
-            };
-
-        (ll, ml, actual_offset)
-    }};
-}
-
-/// Fused decode + offset-resolution for one sequence (upstream zstd shape).
-///
-/// Mirrors upstream zstd `ZSTD_decodeSequence` (zstd_decompress_block.c:1228-1346)
-/// branch-for-branch on the 64-bit path (see [`cshape_resolve`]), with our
-/// optimisation woven back in: the common `total <= 56` case does ONE
-/// `ensure_bits` up front, then all of/ml/ll reads go through
-/// `get_bits_unchecked` (no per-field refill branch). Only the rare
-/// wide-offset case (`total > 56`) falls back to demand-refilled `get_bits`.
-/// This keeps the winning branchy offset/repcode shape while reclaiming the
-/// single-refill efficiency the old PEXT-triple path had.
-///
-/// Our offset table stores `base_value = 1 << ofCode`, so `of_base + raw` is the
-/// offBase domain (1/2/3 = repcodes, >=4 = real offset + 3). The arithmetic here
-/// converts to the real-offset domain that the executor consumes and that
-/// `offset_hist` records (verified equal to `do_offset_history` across its full
-/// test matrix). Expands to `(ll, ml, actual_offset)`; rotates `$hist` in place.
-/// The `total > 56` arm of [`decode_seq_fused_cshape`], out of line.
-///
-/// One `ensure_bits` cannot cover a sequence whose three fields ask for more
-/// bits than the reader holds, so that case re-checks per read. Reaching it
-/// needs a wide offset: with `ll` and `ml` capped at 16 bits each, `of` must
-/// ask for more than 24, which takes a window above 16 MB. Inline it was a
-/// second full copy of the resolve logic sitting beside the hot one, in a
-/// function already carrying seven times the reference's code, for a branch
-/// most frames never take.
-#[cold]
-#[inline(never)]
-// The decoded state this resolves from is eight independent scalars; bundling
-// them into a struct to satisfy the lint would put them through memory on a
-// path whose whole point is to keep the hot one clear.
-#[allow(clippy::too_many_arguments)]
-fn resolve_sequence_wide<K: crate::cpu_kernel::CpuKernel>(
-    br: &mut crate::bit_io::BitReaderReversed<'_, K>,
-    ll_base: u32,
-    ml_base: u32,
-    of_base: u32,
-    ll_bits: u8,
-    ml_bits: u8,
-    of_bits: u8,
-    hist: &mut [u32; 3],
-) -> (u32, u32, u32) {
-    cshape_resolve!(
-        get_bits, ll_base, ml_base, of_base, ll_bits, ml_bits, of_bits, br, hist
-    )
-}
-
-macro_rules! decode_seq_fused_cshape {
-    ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr, $hist:expr,
-     $update_bits:expr, $advance_states:expr) => {{
-        let ll_state = $ll_dec.state;
-        let ml_state = $ml_dec.state;
-        let of_state = $of_dec.state;
-
-        let ll_base = ll_state.base_value;
-        let ml_base = ml_state.base_value;
-        let of_base = of_state.base_value;
-        let ll_bits = ll_state.num_additional_bits;
-        let ml_bits = ml_state.num_additional_bits;
-        let of_bits = of_state.num_additional_bits;
-
-        debug_assert!(of_bits <= MAX_OFFSET_CODE);
-
-        // total = exact bits consumed by this sequence in every arm (rep-0
-        // reads 0 offset bits so total = ml+ll; rep-1 reads 1; real reads ofBits).
-        let total = u16::from(of_bits) + u16::from(ml_bits) + u16::from(ll_bits);
-        // The state advance belongs to the decode, as it does upstream
-        // (`ZSTD_decodeSequence` ends by advancing all three unless this is the
-        // last sequence), and it is here so that ONE refill check covers this
-        // sequence's values AND the transition bits that follow them. Asking
-        // separately, as two `ensure_bits` calls, was the loop's hottest line.
-        let update_bits = u16::from($update_bits);
-        if total + update_bits <= 56 {
-            $br.ensure_bits((total + update_bits) as u8);
-            let resolved = cshape_resolve!(
-                get_bits_unchecked,
-                ll_base,
-                ml_base,
-                of_base,
-                ll_bits,
-                ml_bits,
-                of_bits,
-                $br,
-                $hist
-            );
-            if $advance_states {
-                $ll_dec.update_state_fast($br);
-                $ml_dec.update_state_fast($br);
-                $of_dec.update_state_fast($br);
-            }
-            resolved
-        } else {
-            let resolved = if total <= 56 {
-                $br.ensure_bits(total as u8);
-                cshape_resolve!(
-                    get_bits_unchecked,
-                    ll_base,
-                    ml_base,
-                    of_base,
-                    ll_bits,
-                    ml_bits,
-                    of_bits,
-                    $br,
-                    $hist
-                )
-            } else {
-                resolve_sequence_wide(
-                    $br, ll_base, ml_base, of_base, ll_bits, ml_bits, of_bits, $hist,
-                )
-            };
-            if $advance_states {
-                $br.ensure_bits($update_bits);
-                $ll_dec.update_state_fast($br);
-                $ml_dec.update_state_fast($br);
-                $of_dec.update_state_fast($br);
-            }
-            resolved
-        }
-    }};
-}
-
 /// Textual expansion of per-sequence execute. Fast path: the inlined AVX2
 /// match-copy macro [`exec_sequence_avx2_inline`]. Cold path: legacy
 /// try_push + repeat_lookahead_prefetched. Expands as a statement-block
@@ -778,6 +582,8 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
         // === Short-block arm (straight single-pass fused loop) ===
         let mut shadow_hist = *offset_hist;
         let mut fallback_err: Option<DecompressBlockError> = None;
+        debug_assert!(max_update_bits <= 9 + 9 + 8);
+        br.refill();
         for i in 0..num_sequences {
             // The states advance for the NEXT sequence inside the decode, ahead
             // of executing this one, as upstream advances them at the end of
@@ -785,15 +591,20 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             // execute reads no bits, so the bitstream order is unchanged, and
             // the three FSE states plus the bit reader stop being live across
             // the heavy match copy.
-            let (seq_ll, seq_ml, resolved_offset) = decode_seq_fused_cshape!(
-                &mut ll_dec,
-                &mut ml_dec,
-                &mut of_dec,
+            let seq = super::seq_decoder_scalar::decode_resolved(
+                &ll_dec,
+                &ml_dec,
+                &of_dec,
                 &mut br,
                 &mut shadow_hist,
-                max_update_bits,
-                i + 1 < num_sequences
             );
+            let (seq_ll, seq_ml, resolved_offset) = (seq.ll, seq.ml, seq.of);
+            if i + 1 < num_sequences {
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
+                br.refill();
+            }
             let r = execute_one_body!(
                 &mut cur,
                 buffer,
