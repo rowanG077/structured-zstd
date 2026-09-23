@@ -56,14 +56,22 @@ fn read_additional_bits<K: CpuKernel>(br: &mut BitReaderReversed<'_, K>, n: u8) 
     value as u32
 }
 
-// Resolve repcodes while reading their offset bits, avoiding the generic
-// offset-value decoding/selection round trip for the common zero-bit code.
-// Entry: at least 56 buffered bits. OF (<=31) and ML (<=16) fit together.
-// Refill before LL to cover its <=16 bits plus all three FSE updates (9+9+8).
-// Exit: at least 26 bits remain for those updates, including at stream end,
-// where BitReaderReversed accounts for any zero padding as extra_bits.
+/// Resolve repcodes while reading their offset bits, avoiding the generic
+/// offset-value decoding/selection round trip for the common zero-bit code.
+/// Refills before LL to cover its bits plus all three FSE updates (9+9+8).
+/// Returns with at least 26 bits remaining for those updates, including at
+/// stream end, where `BitReaderReversed` accounts for zero padding as extra bits.
+///
+/// # Safety
+/// The reader must have an initialized window: if `br.index >= 8`, the
+/// eight-byte window `br.source[br.index..br.index + 8]` must be in bounds.
+/// On entry, `br.bits_consumed <= 8` (at least 56 buffered bits).
+/// The decoders must contain validated sequence states, with additional-bit
+/// widths at most 31 for OF and 16 each for LL and ML.
+/// Successful `init_sequence_stream` followed by a refill establishes these
+/// conditions; callers must preserve them across reads and state updates.
 #[inline(always)]
-pub(super) fn decode_resolved<K: CpuKernel>(
+pub(super) unsafe fn decode_resolved<K: CpuKernel>(
     ll_dec: &SeqFSEDecoder<'_>,
     ml_dec: &SeqFSEDecoder<'_>,
     of_dec: &SeqFSEDecoder<'_>,
@@ -111,7 +119,10 @@ pub(super) fn decode_resolved<K: CpuKernel>(
     let ll_budget = ll.num_additional_bits + 9 + 9 + 8;
     debug_assert!(ll_budget <= 56);
     if br.bits_consumed + ll_budget > 64 {
-        br.refill();
+        // SAFETY: the caller guarantees an initialized window and at most eight
+        // consumed bits on entry. OF/ML consume at most 31+16 more, so the total
+        // stays within 64 bits and the refill only retreats the valid window.
+        unsafe { br.refill_sequence() };
     }
     let ll_add = if ll.num_additional_bits == 0 {
         0
@@ -390,16 +401,24 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
         let mut shadow_hist = *offset_hist;
         let mut fallback_err: Option<DecompressBlockError> = None;
         debug_assert!(max_update_bits <= 9 + 9 + 8);
-        br.refill();
+        // SAFETY: init_sequence_stream read the padding marker and FSE states,
+        // establishing the reader window. The read budget keeps consumption <=64.
+        unsafe { br.refill_sequence() };
         for i in 0..num_sequences {
-            let seq = decode_resolved(&ll_dec, &ml_dec, &of_dec, &mut br, &mut shadow_hist);
+            // SAFETY: init_sequence_stream validated the states and established
+            // the reader window. The initial and per-sequence refills restore
+            // bits_consumed < 8; decode_resolved reserves the state-update budget.
+            let seq =
+                unsafe { decode_resolved(&ll_dec, &ml_dec, &of_dec, &mut br, &mut shadow_hist) };
             let resolved_offset = seq.of;
             if i + 1 < num_sequences {
                 ll_dec.update_state_fast(&mut br);
                 ml_dec.update_state_fast(&mut br);
                 of_dec.update_state_fast(&mut br);
                 // Start the next input load before copying this sequence's output.
-                br.refill();
+                // SAFETY: decode_resolved budgets these three state updates;
+                // the source is unchanged and the initialized window only retreats.
+                unsafe { br.refill_sequence() };
             }
             let r = execute_one_body!(
                 buffer,

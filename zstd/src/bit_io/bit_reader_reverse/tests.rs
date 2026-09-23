@@ -492,3 +492,35 @@ fn extract_triple_matches_the_reference_under_every_kernel() {
         }
     }
 }
+
+#[test]
+fn initialized_sequence_refill_matches_checked_refill_at_all_boundaries() {
+    // Includes empty/short sources, the eight-byte fast-path boundary, zero
+    // progress, every possible buffered bit count, and repeated exhaustion.
+    for len in 0..=64 {
+        let source: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 71 + len * 13) as u8).collect();
+        for first_consumed in 0..=64 {
+            let mut checked = BitReaderReversed::<ScalarKernel>::new(&source);
+            let mut sequence = BitReaderReversed::<ScalarKernel>::new(&source);
+            checked.refill();
+            sequence.refill();
+            for iteration in 0..20 {
+                let consumed = if iteration == 0 {
+                    first_consumed
+                } else {
+                    (iteration * 17 + len) % (65 - checked.bits_consumed as usize)
+                };
+                checked.consume(consumed as u8);
+                sequence.consume(consumed as u8);
+                checked.refill();
+                // SAFETY: the initial checked refill established the window,
+                // and each iteration consumes at most 64 buffered bits.
+                unsafe { sequence.refill_sequence() };
+                assert_eq!(sequence.index, checked.index);
+                assert_eq!(sequence.bits_consumed, checked.bits_consumed);
+                assert_eq!(sequence.bit_container, checked.bit_container);
+                assert_eq!(sequence.bits_remaining(), checked.bits_remaining());
+            }
+        }
+    }
+}

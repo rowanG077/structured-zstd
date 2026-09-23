@@ -591,13 +591,19 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             // execute reads no bits, so the bitstream order is unchanged, and
             // the three FSE states plus the bit reader stop being live across
             // the heavy match copy.
-            let seq = super::seq_decoder_scalar::decode_resolved(
-                &ll_dec,
-                &ml_dec,
-                &of_dec,
-                &mut br,
-                &mut shadow_hist,
-            );
+            // SAFETY: init_sequence_stream validated the states and established
+            // the reader window. The initial and per-sequence checked refills
+            // restore bits_consumed < 8, and decode_resolved reserves enough
+            // bits for the state updates below.
+            let seq = unsafe {
+                super::seq_decoder_scalar::decode_resolved(
+                    &ll_dec,
+                    &ml_dec,
+                    &of_dec,
+                    &mut br,
+                    &mut shadow_hist,
+                )
+            };
             let (seq_ll, seq_ml, resolved_offset) = (seq.ll, seq.ml, seq.of);
             if i + 1 < num_sequences {
                 ll_dec.update_state_fast(&mut br);

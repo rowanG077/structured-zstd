@@ -128,6 +128,48 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         debug_assert!(self.bits_consumed < 8);
     }
 
+    /// Reload an already-initialized sequence reader. ARM and x64 use the
+    /// established window bounds; other targets retain the checked reader.
+    ///
+    /// # Safety
+    /// At most 64 bits have been consumed. If `index >= 8`, an eight-byte
+    /// window at `source[index..index + 8]` must already be valid. Sequence
+    /// initialization establishes this by reading the padding marker; every
+    /// subsequent refill only moves the window toward the start of the source.
+    #[inline(always)]
+    pub(crate) unsafe fn refill_sequence(&mut self) {
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        self.refill();
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        {
+            debug_assert!(self.bits_consumed <= 64);
+            let bytes_consumed = usize::from(self.bits_consumed) / 8;
+            if bytes_consumed == 0 {
+                return;
+            }
+            if self.index >= 8 {
+                debug_assert!(
+                    self.index
+                        .checked_add(8)
+                        .is_some_and(|end| end <= self.source.len())
+                );
+                self.index -= bytes_consumed;
+                self.bits_consumed &= 7;
+                // SAFETY: the old window was in bounds and it moves backward by
+                // at most eight bytes. The index gate prevents underflow.
+                self.bit_container = u64::from_le(unsafe {
+                    self.source
+                        .as_ptr()
+                        .add(self.index)
+                        .cast::<u64>()
+                        .read_unaligned()
+                });
+            } else {
+                self.refill();
+            }
+        }
+    }
+
     /// End-of-stream refill paths — runs when the next 8-byte window would
     /// underflow the source buffer. Keep it cold but inline: an out-of-line
     /// mutable borrow forces the reader's fields into memory across the
