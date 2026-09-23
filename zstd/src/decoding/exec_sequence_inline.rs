@@ -553,8 +553,7 @@ pub(crate) mod portable {
     #[inline(always)]
     pub(crate) unsafe fn copy16(dst: *mut u8, src: *const u8) {
         unsafe {
-            let v: u128 = src.cast::<u128>().read_unaligned();
-            dst.cast::<u128>().write_unaligned(v);
+            core::ptr::copy_nonoverlapping(src, dst, 16);
         }
     }
 
