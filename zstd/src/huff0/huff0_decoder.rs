@@ -27,7 +27,7 @@ impl<'t> HuffmanDecoder<'t> {
     #[cfg(feature = "fuzz-exports")]
     #[inline(always)]
     fn decode_symbol(&mut self) -> u8 {
-        self.table.packed_decode[self.state as usize] as u8
+        (self.table.packed_decode[self.state as usize] >> 8) as u8
     }
 
     /// Fuzz-only shim for reading the symbol at the current state.
@@ -64,7 +64,7 @@ impl<'t> HuffmanDecoder<'t> {
     ) -> u8 {
         // self.state stores a small section, or a window of the bit stream. The table can be indexed via this state,
         // telling you how many bits identify the current symbol.
-        let num_bits = (self.table.packed_decode[self.state as usize] >> 8) as u8;
+        let num_bits = self.table.packed_decode[self.state as usize] as u8;
         // New bits are read from the stream
         let new_bits = br.get_bits(num_bits);
         // Shift and mask out the bits that identify the current symbol
@@ -100,10 +100,10 @@ impl<'t> HuffmanDecoder<'t> {
         br: &mut BitReaderReversed<'_, K>,
     ) -> u8 {
         let packed = self.table.packed_decode[self.state as usize];
-        let num_bits = (packed >> 8) as u8;
+        let num_bits = packed as u8;
         let new_bits = br.get_bits(num_bits);
         self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
-        packed as u8
+        (packed >> 8) as u8
     }
 
     /// Decode one symbol WITHOUT refilling the bit reader. The caller must have
@@ -120,10 +120,10 @@ impl<'t> HuffmanDecoder<'t> {
         br: &mut BitReaderReversed<'_, K>,
     ) -> u8 {
         let packed = self.table.packed_decode[self.state as usize];
-        let num_bits = (packed >> 8) as u8;
+        let num_bits = packed as u8;
         let new_bits = br.get_bits_unchecked(num_bits);
         self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
-        packed as u8
+        (packed >> 8) as u8
     }
 
     // aarch64 NEON / SVE kernels for `decode_symbol_and_advance` were
@@ -139,25 +139,10 @@ impl<'t> HuffmanDecoder<'t> {
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
 #[derive(Clone)]
 pub struct HuffmanTable {
-    /// Packed `symbol | (num_bits << 8)` per state index, exposed
-    /// `pub(crate)` because the HUF 4-stream burst hot path in
-    /// `literals_section_decoder::decode_literals` indexes it directly
-    /// (`packed_decode[idx]`) for a single-load table lookup matching
-    /// upstream zstd `huf_decompress.c:dtable[index]`. This is the primary
-    /// (and only) 4-stream decode lookup table since the previous
-    /// SIMD-fallback dispatch was removed in favour of upstream zstd's
-    /// always-firing burst.
-    ///
-    /// **`u16` (matches upstream zstd `HUF_DEltX1` layout exactly).** Upstream zstd's
-    /// `dtable[index]` returns a 2-byte entry — low byte is `symbol`,
-    /// high byte is `nbBits`. We mirror that representation so the
-    /// table size is `2 × (1 << max_num_bits)` bytes instead of `4 ×`.
-    /// At `max_num_bits = 11` (zstd spec ceiling) that's 4 KiB vs the
-    /// older 8 KiB representation — halves L1d footprint on the hot
-    /// HUF decode path. Worth the change because the L-7 Fast workload
-    /// (and any small-alphabet poorly-compressed input) decodes most
-    /// output bytes through this table; literal-buffer pressure on
-    /// L1d makes the cache hit rate sensitive to table footprint.
+    /// Packed `num_bits | (symbol << 8)` per state. Keeping the bit count
+    /// in the low byte lets the 4-stream decoder shift directly by the entry
+    /// (modulo 64), without extracting it on the dependent bitstream path.
+    /// Entries remain two bytes: at most 4 KiB for the 11-bit table.
     pub(crate) packed_decode: Vec<u16>,
     /// The weight of a symbol is the number of occurrences in a table.
     /// This value is used in constructing a binary tree referred to as
@@ -171,7 +156,7 @@ pub struct HuffmanTable {
     pub max_num_bits: u8,
     state_mask: u64,
     bits: Vec<u8>,
-    bit_ranks: Vec<u32>,
+    bit_ranks: [u32; (MAX_MAX_NUM_BITS as usize) + 1],
     /// Running `sum(1 << (w - 1))` accumulated WHILE weights decode
     /// (upstream zstd `HUF_readStats` keeps the same running stats), replacing a
     /// separate post-decode pass over `weights`.
@@ -194,7 +179,6 @@ impl HuffmanTable {
         self.packed_decode.capacity() * core::mem::size_of::<u16>()
             + self.weights.capacity()
             + self.bits.capacity()
-            + self.bit_ranks.capacity() * core::mem::size_of::<u32>()
             + self.fse_table.heap_bytes()
     }
 
@@ -207,7 +191,7 @@ impl HuffmanTable {
             max_num_bits: 0,
             state_mask: 0,
             bits: Vec::with_capacity(256),
-            bit_ranks: Vec::with_capacity(11),
+            bit_ranks: [0; (MAX_MAX_NUM_BITS as usize) + 1],
             weight_sum: 0,
             weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],
             last_weight: 0,
@@ -237,7 +221,7 @@ impl HuffmanTable {
         self.max_num_bits = 0;
         self.state_mask = 0;
         self.bits.clear();
-        self.bit_ranks.clear();
+        self.bit_ranks.fill(0);
         self.weight_sum = 0;
         self.weight_rank_count = [0; (MAX_MAX_NUM_BITS as usize) + 1];
         self.last_weight = 0;
@@ -570,8 +554,7 @@ impl HuffmanTable {
         // a weight `w > 0` maps to `bits = max_bits + 1 - w`, weight 0
         // stays code-length 0, and the inferred last symbol contributes
         // one extra entry at its derived length.
-        self.bit_ranks.clear();
-        self.bit_ranks.resize((max_bits + 1) as usize, 0);
+        self.bit_ranks.fill(0);
         self.bit_ranks[0] = self.weight_rank_count[0];
         for w in 1..=max_bits {
             self.bit_ranks[(max_bits + 1 - w) as usize] = self.weight_rank_count[w as usize];
@@ -631,8 +614,7 @@ impl HuffmanTable {
         let mut sym_off = [0usize; 16];
         let mut acc = 0usize;
         // Prefix sum of the per-code-length counts: `sym_off[l]` is the start
-        // index of the length-`l` run in `sorted`. `bit_ranks` has exactly
-        // `max_bits + 1` entries (<= 12), so zipping bounds the walk.
+        // index of the length-`l` run in `sorted`. `bit_ranks` has 12 entries; counts above `max_bits` are zero.
         for (off, &rank) in sym_off.iter_mut().zip(self.bit_ranks.iter()) {
             *off = acc;
             acc += rank as usize;
@@ -674,7 +656,7 @@ impl HuffmanTable {
             macro_rules! packed64 {
                 ($s:expr) => {{
                     let symbol = unsafe { *sorted.get_unchecked(grp + $s) };
-                    let packed = u16::from(symbol) | (u16::from(len) << 8);
+                    let packed = u16::from(len) | (u16::from(symbol) << 8);
                     (packed, u64::from(packed) * 0x0001_0001_0001_0001)
                 }};
             }

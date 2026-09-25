@@ -63,3 +63,13 @@ fn offset_history_zero_offset_preserves_error_path() {
     assert_eq!(actual, 0);
     assert_eq!(hist, [10, 20, 30]);
 }
+
+#[test]
+fn repcode_minus_one_preserves_invalid_zero_and_wrapping_edges() {
+    let mut one = [1, 4, 8];
+    assert_eq!(do_offset_history(3, 0, &mut one), 0);
+    assert_eq!(one, [0, 1, 4]);
+    let mut zero = [0, 4, 8];
+    assert_eq!(do_offset_history(3, 0, &mut zero), u32::MAX);
+    assert_eq!(zero, [u32::MAX, 0, 4]);
+}

@@ -288,7 +288,7 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
 pub type FSETable = FSETableImpl<Entry, 64>;
 
 /// Compact sequence-section variant. Backed by 8-byte [`SeqSymbol`]
-/// entries instead of the 12-byte HUF [`Entry`] — matches upstream zstd
+/// entries carrying sequence metadata — matches upstream zstd
 /// `ZSTD_seqSymbol`. The per-entry `symbol` byte is dropped. Build
 /// flow: [`FseEntry::from_raw`] zero-inits `base_value` /
 /// `num_additional_bits` on insert; the LL / ML / OF enrich passes
@@ -879,10 +879,15 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         fn field_at(source: &[u8], bit_pos: usize, n: usize) -> u64 {
             debug_assert!(n <= 32);
             let byte = bit_pos >> 3;
-            let mut window = [0u8; 8];
-            let take = source.len().saturating_sub(byte).min(8);
-            window[..take].copy_from_slice(&source[byte..byte + take]);
-            (u64::from_le_bytes(window) >> (bit_pos & 7)) & ((1u64 << n) - 1)
+            let remaining = &source[byte..];
+            let window = if let Some(bytes) = remaining.first_chunk::<8>() {
+                u64::from_le_bytes(*bytes)
+            } else {
+                let mut window = [0u8; 8];
+                window[..remaining.len()].copy_from_slice(remaining);
+                u64::from_le_bytes(window)
+            };
+            (window >> (bit_pos & 7)) & ((1u64 << n) - 1)
         }
         macro_rules! read_bits {
             ($n:expr) => {{
@@ -1066,64 +1071,27 @@ impl FSETableImpl<SeqSymbol, 512> {
 /// Sequence-section decoder alias: reads 8-byte [`SeqSymbol`] entries.
 pub type SeqFSEDecoder<'t> = FSEDecoderImpl<'t, SeqSymbol, 512>;
 
-/// A single entry in an FSE table.
-///
-/// The first four bytes (`new_state`, `symbol`, `num_bits`) mirror the
-/// classical upstream zstd `FSE_decode_t` layout used by every FSE-backed
-/// decoder in the crate (sequence-section LL/ML/OF, HUF-weight
-/// stream). The trailing `base_value` + `num_additional_bits`
-/// fields are populated only by the LL / ML / OF tables in the
-/// sequence-section decoder (upstream zstd `ZSTD_seqSymbol` shape) so the
-/// per-sequence hot path can read them directly off the active
-/// entry instead of issuing a second lookup into a separate
-/// metadata table. HUF tables leave these two fields at their
-/// default zero — the extra eight bytes per slot are a fixed cost
-/// on the small HUF FSE table (≤ 64 entries) and the dominant
-/// savings live in the sequence section.
+/// A Huffman-weight FSE entry. Sequence metadata belongs to [`SeqSymbol`].
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Entry {
-    /// Base index for the next state. The low bits read from the bitstream are
-    /// added to this value to produce the final state index.
+    /// Base index for the next state.
     pub new_state: u16,
-    /// The byte that should be put in the decode output when encountering this state.
+    /// Decoded symbol.
     pub symbol: u8,
-    /// How many bits should be read from the stream when decoding this entry.
+    /// Bits read on the next state transition.
     pub num_bits: u8,
-    /// For LL / ML / OF tables: pre-computed code baseline.
-    /// `actual_value = base_value + extra_bits_read`. Upstream zstd
-    /// `ZSTD_seqSymbol::baseValue`. Populated by the per-table
-    /// `enrich_for_*` post-build pass; stays 0 for FSE tables that
-    /// don't need it (HUF-weight stream).
-    pub base_value: u32,
-    /// For LL / ML / OF tables: number of bits to read from the
-    /// bitstream after the symbol has been decoded, to obtain the
-    /// additional value to add to `base_value`. Upstream zstd
-    /// `ZSTD_seqSymbol::nbAdditionalBits`. Populated alongside
-    /// `base_value`; stays 0 for FSE tables that don't need it.
-    pub num_additional_bits: u8,
 }
 
-#[cfg(target_endian = "little")]
 const _: [(); 0] = [(); core::mem::offset_of!(Entry, new_state)];
-#[cfg(target_endian = "little")]
 const _: [(); 2] = [(); core::mem::offset_of!(Entry, symbol)];
-#[cfg(target_endian = "little")]
 const _: [(); 3] = [(); core::mem::offset_of!(Entry, num_bits)];
-#[cfg(target_endian = "little")]
-const _: [(); 4] = [(); core::mem::offset_of!(Entry, base_value)];
-#[cfg(target_endian = "little")]
-const _: [(); 8] = [(); core::mem::offset_of!(Entry, num_additional_bits)];
-// 12 bytes: 4 (header) + 4 (base_value) + 1 (num_additional_bits)
-// + 3 bytes tail padding for natural u32 alignment.
-#[cfg(target_endian = "little")]
-const _: [(); 12] = [(); core::mem::size_of::<Entry>()];
+const _: [(); 4] = [(); core::mem::size_of::<Entry>()];
 
 /// Compact sequence-section FSE entry, mirroring upstream zstd's
 /// `ZSTD_seqSymbol` exactly: no `symbol` field (the sequence-section
 /// decoder reads `base_value` / `num_additional_bits` directly off
-/// the active state and never needs the source byte). 8 bytes vs
-/// the 12-byte HUF-grade `Entry`. Field order matches upstream zstd so the
+/// the active state and never needs the source byte). Field order matches upstream zstd so the
 /// init-state path can issue a single aligned 8-byte load.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -1219,8 +1187,6 @@ impl FseEntry for Entry {
             new_state,
             symbol,
             num_bits,
-            base_value: 0,
-            num_additional_bits: 0,
         }
     }
 }

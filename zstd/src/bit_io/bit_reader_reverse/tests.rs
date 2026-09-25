@@ -99,6 +99,31 @@ fn it_works() {
     assert_eq!(br.bits_remaining(), -7);
 }
 
+#[test]
+fn repeated_refills_preserve_bits_across_short_inputs_and_exhaustion() {
+    for len in 0..=80 {
+        let data: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 37 + 19) as u8).collect();
+        let mut br = super::BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&data);
+        let mut consumed = 0usize;
+        for step in 0..100 {
+            // Include zero-consumption refills and windows shorter than 8 bytes.
+            br.refill();
+            br.refill();
+            let width = (step * 13 + len * 7) % 57;
+            let mut expected = 0u64;
+            for bit in consumed..consumed + width {
+                expected <<= 1;
+                if bit < len * 8 {
+                    expected |= u64::from((data[len - 1 - bit / 8] >> (7 - bit % 8)) & 1);
+                }
+            }
+            assert_eq!(br.get_bits(width as u8), expected, "len={len}, step={step}");
+            consumed += width;
+            assert_eq!(br.bits_remaining(), (len * 8) as isize - consumed as isize);
+        }
+    }
+}
+
 /// Verify that `ensure_bits(n)` + `get_bits_unchecked(..)` returns the same
 /// values as plain `get_bits(..)`, including across refill boundaries and
 /// for edge cases like n=0.
@@ -464,6 +489,38 @@ fn extract_triple_matches_the_reference_under_every_kernel() {
                 crate::cpu_kernel::Bmi2Kernel::extract_triple(all_three, n1, n2, n3),
                 expected
             );
+        }
+    }
+}
+
+#[test]
+fn initialized_sequence_refill_matches_checked_refill_at_all_boundaries() {
+    // Includes empty/short sources, the eight-byte fast-path boundary, zero
+    // progress, every possible buffered bit count, and repeated exhaustion.
+    for len in 0..=64 {
+        let source: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 71 + len * 13) as u8).collect();
+        for first_consumed in 0..=64 {
+            let mut checked = BitReaderReversed::<ScalarKernel>::new(&source);
+            let mut sequence = BitReaderReversed::<ScalarKernel>::new(&source);
+            checked.refill();
+            sequence.refill();
+            for iteration in 0..20 {
+                let consumed = if iteration == 0 {
+                    first_consumed
+                } else {
+                    (iteration * 17 + len) % (65 - checked.bits_consumed as usize)
+                };
+                checked.consume(consumed as u8);
+                sequence.consume(consumed as u8);
+                checked.refill();
+                // SAFETY: the initial checked refill established the window,
+                // and each iteration consumes at most 64 buffered bits.
+                unsafe { sequence.refill_sequence() };
+                assert_eq!(sequence.index, checked.index);
+                assert_eq!(sequence.bits_consumed, checked.bits_consumed);
+                assert_eq!(sequence.bit_container, checked.bit_container);
+                assert_eq!(sequence.bits_remaining(), checked.bits_remaining());
+            }
         }
     }
 }

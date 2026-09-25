@@ -100,20 +100,23 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
     /// (refill fires roughly every 2 sequences during sequence decode, so
     /// it is NOT cold). The rare edge cases — running out of source, going
     /// past the start of the stream, exhausting all useful bits — branch
-    /// out to `refill_slow` which keeps the `#[cold] #[inline(never)]`
-    /// treatment they actually deserve.
+    /// into the cold `refill_slow` path. Both bodies inline so the reader's
+    /// state can stay in registers across the sequence loop.
     #[inline(always)]
-    fn refill(&mut self) {
+    pub(crate) fn refill(&mut self) {
         let bytes_consumed = self.bits_consumed as usize / 8;
-        if bytes_consumed == 0 {
-            return;
-        }
-
-        if self.index >= bytes_consumed {
-            // We can safely move the window contained in `bit_container` down by `bytes_consumed`
-            // If the reader wasn't byte aligned, the byte that was partially read is now in the highest order bits in the `bit_container`
+        if cfg!(target_arch = "x86_64") && self.index >= 8 {
+            // The live bit count is at most 64, so this input window has
+            // room for every possible byte advance, including zero.
+            debug_assert!(bytes_consumed <= 8);
             self.index -= bytes_consumed;
-            // Some bits of the `bits_container` might have been consumed already because we read the window byte aligned
+            self.bits_consumed &= 7;
+            self.bit_container =
+                u64::from_le_bytes((&self.source[self.index..][..8]).try_into().unwrap());
+        } else if bytes_consumed == 0 {
+            return;
+        } else if self.index >= bytes_consumed {
+            self.index -= bytes_consumed;
             self.bits_consumed &= 7;
             self.bit_container =
                 u64::from_le_bytes((&self.source[self.index..][..8]).try_into().unwrap());
@@ -125,12 +128,54 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
         debug_assert!(self.bits_consumed < 8);
     }
 
+    /// Reload an already-initialized sequence reader. ARM and x64 use the
+    /// established window bounds; other targets retain the checked reader.
+    ///
+    /// # Safety
+    /// At most 64 bits have been consumed. If `index >= 8`, an eight-byte
+    /// window at `source[index..index + 8]` must already be valid. Sequence
+    /// initialization establishes this by reading the padding marker; every
+    /// subsequent refill only moves the window toward the start of the source.
+    #[inline(always)]
+    pub(crate) unsafe fn refill_sequence(&mut self) {
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        self.refill();
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        {
+            debug_assert!(self.bits_consumed <= 64);
+            let bytes_consumed = usize::from(self.bits_consumed) / 8;
+            if bytes_consumed == 0 {
+                return;
+            }
+            if self.index >= 8 {
+                debug_assert!(
+                    self.index
+                        .checked_add(8)
+                        .is_some_and(|end| end <= self.source.len())
+                );
+                self.index -= bytes_consumed;
+                self.bits_consumed &= 7;
+                // SAFETY: the old window was in bounds and it moves backward by
+                // at most eight bytes. The index gate prevents underflow.
+                self.bit_container = u64::from_le(unsafe {
+                    self.source
+                        .as_ptr()
+                        .add(self.index)
+                        .cast::<u64>()
+                        .read_unaligned()
+                });
+            } else {
+                self.refill();
+            }
+        }
+    }
+
     /// End-of-stream refill paths — runs when the next 8-byte window would
-    /// underflow the source buffer. Kept `#[cold] #[inline(never)]` so the
-    /// hot mid-stream path in [`refill`] folds into call sites without
-    /// dragging these branches along.
+    /// underflow the source buffer. Keep it cold but inline: an out-of-line
+    /// mutable borrow forces the reader's fields into memory across the
+    /// sequence loop, even when this end-of-stream branch is not taken.
     #[cold]
-    #[inline(never)]
+    #[inline(always)]
     fn refill_slow(&mut self) {
         if self.index > 0 {
             // Read the last portion of source into the `bit_container`
@@ -148,16 +193,13 @@ impl<'s, K: CpuKernel> BitReaderReversed<'s, K> {
             self.bit_container <<= self.bits_consumed;
             self.extra_bits += self.bits_consumed as usize;
             self.bits_consumed = 0;
-        } else if self.bits_consumed < 64 {
-            // Shift out already used bits and fill up with zeroes
-            self.bit_container <<= self.bits_consumed;
-            self.extra_bits += self.bits_consumed as usize;
-            self.bits_consumed = 0;
         } else {
-            // All useful bits have already been read and more than 64 bits have been consumed, all we now do is return zeroes
+            self.bit_container = self
+                .bit_container
+                .checked_shl(u32::from(self.bits_consumed))
+                .unwrap_or(0);
             self.extra_bits += self.bits_consumed as usize;
             self.bits_consumed = 0;
-            self.bit_container = 0;
         }
     }
 

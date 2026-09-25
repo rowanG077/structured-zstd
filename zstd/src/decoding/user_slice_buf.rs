@@ -273,31 +273,15 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         use super::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
-        // Fallible capacity check for the literal+match copies, with
-        // `overshoot = 0` — the SIMD wildcopy's up-to-15-byte tail overshoot
-        // is NOT absorbed by caller-side slice slack (the slice carries none);
-        // it is handled by the tight-tail bounded branch below. On a malformed
-        // frame whose sequences overproduce past `frame_content_size`, the
-        // check returns `ExecuteSequencesError::OutputBufferOverflow` so the
-        // safe public decode APIs (`decode_all`, `decode_all_to_vec`)
-        // surface a structured `FrameDecoderError` rather than
-        // panic on the unsafe write surface.
-        //
-        // All sums use `checked_*` so adversarial input that would
-        // wrap `usize` produces the same error variant instead of
-        // wrapping past the slice length and letting the subsequent
-        // unsafe pointer math go out of bounds.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         let cap = self.sequence_cap;
-        // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and
-        // every prior sequence advanced `tail` only after this same check),
-        // satisfying the `tail <= cap` precondition; see `sequence_output_fits`.
-        // Hard guard with `overshoot = 0`: errors only on a genuine
-        // exact-fit overflow. The <=15-byte SIMD wildcopy slack is
-        // handled by the tight-tail branch below, so the caller slice
-        // no longer needs `WILDCOPY_OVERLENGTH` trailing slack for the
-        // direct-decode path — `cap >= frame_content_size` suffices.
-        let total = sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
+        // Check capacity once on the hot path. The tight-tail branch checks
+        // whether an exact copy fits and reports malformed output lengths.
+        // Each sequence-table length is <=131074; on x86_64, adding both
+        // lengths and the slack to a slice position (<=isize::MAX) cannot wrap.
+        debug_assert!(self.tail <= cap);
+        debug_assert!(lit_length <= 131074 && match_length <= 131074);
+        let total = lit_length + match_length;
         let new_tail = self.tail + total;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
@@ -326,7 +310,8 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // final sequence(s) near the buffer end stay in-bounds. Only
         // the trailing sequence(s) of a tightly-sized output slice hit
         // this; the bulk of the frame still takes the SIMD fast path.
-        if total + MAX_WILDCOPY_OVERSHOOT > cap - self.tail {
+        if new_tail + MAX_WILDCOPY_OVERSHOOT > cap {
+            sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: `total <= cap - tail` (guard above), so the exact
             // copies stay in-bounds; `offset <= tail + lit_length`
             // keeps the match source valid; `lit_src` reads exactly
@@ -400,11 +385,16 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         };
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         let cap = self.sequence_cap;
-        // `self.tail <= cap` precondition holds as in the SSE2 arm; see
-        // `sequence_output_fits`. Hard guard with `overshoot = 0`; the
-        // <=15-byte wildcopy slack is handled by the tight-tail branch
-        // below (see the x86 arm for the rationale).
-        let total = sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
+        // Check capacity once on the hot path; the tight-tail branch checks
+        // whether an exact copy fits. Sequence lengths are bounded by the FSE tables, and the caller's
+        // slice is at most isize::MAX bytes, so these additions cannot wrap.
+        debug_assert!(self.tail <= cap);
+        debug_assert!(
+            self.tail
+                .checked_add(lit_length + match_length + MAX_WILDCOPY_OVERSHOOT)
+                .is_some()
+        );
+        let total = lit_length + match_length;
         let new_tail = self.tail + total;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
@@ -422,7 +412,8 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         );
 
         // Tight-tail bounded copy; see the x86 arm for the rationale.
-        if total + MAX_WILDCOPY_OVERSHOOT > cap - self.tail {
+        if new_tail + MAX_WILDCOPY_OVERSHOOT > cap {
+            sequence_output_fits(lit_length, match_length, self.tail, cap, 0)?;
             // SAFETY: `total <= cap - tail` (guard above) bounds the
             // exact copies; `offset <= tail + lit_length` keeps the
             // match source valid; `lit_src` reads exactly `lit_length`

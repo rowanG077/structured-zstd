@@ -510,7 +510,8 @@ fn decompress_literals_impl<K: CpuKernel>(
 
         // Burst is identical across all kernels (upstream zstd parity: reads
         // `packed[idx]` u16 directly + `MEM_read64` reload pattern,
-        // no SIMD intrinsics needed). Single un-genericised call.
+        // no SIMD intrinsics needed). Specialize common widths so the table
+        // index uses an immediate shift and the burst length is constant.
         //
         // SAFETY: caller guarantees `brs[s].source` is the same as the
         // stream slice each decoder was initialised against; `target_ptr`
@@ -519,14 +520,23 @@ fn decompress_literals_impl<K: CpuKernel>(
         // [base, base+regen) are in-bounds; `packed` length matches
         // `1 << max_num_bits` by `HuffmanTable::build_decoder`'s `resize`.
         unsafe {
-            run_4stream_burst_loop(
-                &mut decoders,
-                &mut brs,
-                target_ptr,
-                packed,
-                &mut cursors,
-                &bounds,
-            );
+            macro_rules! run {
+                ($bits:literal) => {
+                    run_4stream_burst_loop::<K, $bits>(
+                        &mut decoders,
+                        &mut brs,
+                        target_ptr,
+                        packed,
+                        &mut cursors,
+                        &bounds,
+                    )
+                };
+            }
+            match max_num_bits {
+                10 => run!(10),
+                11 => run!(11),
+                _ => run!(0),
+            }
         }
 
         // Drain remaining symbols from each stream, bounded by segment end.
@@ -707,8 +717,9 @@ struct LoopBounds {
 ///
 /// Each `brs[s].source` must be the slice the corresponding decoder
 /// was initialised against.
-#[inline(always)]
-unsafe fn run_4stream_burst_loop<K: CpuKernel>(
+#[cfg_attr(target_arch = "aarch64", inline(never))]
+#[cfg_attr(not(target_arch = "aarch64"), inline(always))]
+unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     decoders: &mut [HuffmanDecoder<'_>; 4],
     brs: &mut [BitReaderReversed<'_, K>; 4],
     target_ptr: *mut u8,
@@ -724,6 +735,22 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         burst_eligible,
         alloc_upper_bound,
     } = *bounds;
+    debug_assert!(TABLE_BITS == 0 || table_shift == 64 - u32::from(TABLE_BITS));
+    let table_shift = if TABLE_BITS == 0 {
+        table_shift
+    } else {
+        64 - u32::from(TABLE_BITS)
+    };
+    let symbols_per_burst = if TABLE_BITS == 0 {
+        symbols_per_burst
+    } else {
+        55 / usize::from(TABLE_BITS)
+    };
+    let burst_bits = if TABLE_BITS == 0 {
+        burst_bits
+    } else {
+        symbols_per_burst as u8 * TABLE_BITS
+    };
     let max_num_bits = (64 - table_shift) as u8;
 
     // Skip burst entirely if min_seg_len < symbols_per_burst — drain
@@ -835,9 +862,11 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         ($b:ident, $c:ident) => {{
             let idx = ($b >> table_shift) as usize;
             let entry = unsafe { *packed.get_unchecked(idx) };
-            unsafe { target_ptr.add($c).write((entry & 0xFF) as u8) };
+            unsafe { target_ptr.add($c).write((entry >> 8) as u8) };
             $c += 1;
-            $b <<= (entry >> 8) & 0xFF;
+            // The low byte is <=11 bits; wrapping_shl discards the symbol
+            // byte while keeping the bit count on the dependent path.
+            $b = $b.wrapping_shl(u32::from(entry));
         }};
     }
     // Reload one stream (upstream zstd `HUF_4X1_RELOAD_STREAM`):

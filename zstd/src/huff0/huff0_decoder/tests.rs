@@ -2,12 +2,12 @@ use super::*;
 use alloc::vec;
 
 fn test_table() -> HuffmanTable {
-    // Packed `symbol | (num_bits << 8)` per state index (upstream zstd `HUF_DEltX1`).
+    // Packed `num_bits | (symbol << 8)` per state index (upstream zstd `HUF_DEltX1`).
     let packed_decode = vec![
-        u16::from(b'A') | (1u16 << 8),
-        u16::from(b'B') | (2u16 << 8),
-        u16::from(b'C') | (1u16 << 8),
-        u16::from(b'D') | (2u16 << 8),
+        1u16 | (u16::from(b'A') << 8),
+        2u16 | (u16::from(b'B') << 8),
+        1u16 | (u16::from(b'C') << 8),
+        2u16 | (u16::from(b'D') << 8),
     ];
 
     HuffmanTable {
@@ -16,7 +16,7 @@ fn test_table() -> HuffmanTable {
         max_num_bits: 2,
         state_mask: 0b11,
         bits: Vec::new(),
-        bit_ranks: Vec::new(),
+        bit_ranks: [0; (MAX_MAX_NUM_BITS as usize) + 1],
         weight_sum: 0,
         weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],
         last_weight: 0,
@@ -75,8 +75,8 @@ fn decode_symbol_and_advance_scalar_matches_manual_transition() {
     let table = test_table();
     let initial_state = 1_u64;
     let packed = table.packed_decode[initial_state as usize];
-    let entry_num_bits = (packed >> 8) as u8;
-    let entry_symbol = packed as u8;
+    let entry_num_bits = packed as u8;
+    let entry_symbol = (packed >> 8) as u8;
     let mut manual_br =
         BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&[0b10101010, 0b01010101]);
     let expected_new_bits = manual_br.get_bits(entry_num_bits);
@@ -107,7 +107,7 @@ fn every_kernel_advances_the_state_alike() {
     let mut table = test_table();
     // State 3 decoding one bit leaves `(3 << 1) & 0b11 == 0b10` behind, so the
     // mask has something to keep and a kernel that masked wrongly would show.
-    table.packed_decode[3] = u16::from(b'D') | (1u16 << 8);
+    table.packed_decode[3] = 1u16 | (u16::from(b'D') << 8);
     let source = [0b10101010, 0b01010101];
     const START: u64 = 3;
 
