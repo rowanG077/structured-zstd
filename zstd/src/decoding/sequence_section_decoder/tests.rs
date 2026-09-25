@@ -1,6 +1,8 @@
 use super::*;
 use alloc::vec::Vec;
 
+mod long_pipeline;
+
 /// Regression gate for the predefined FSE table cache: every cached
 /// table must be byte-identical to the table the rebuild path would
 /// produce on the next call. If the cache ever drifts from the
