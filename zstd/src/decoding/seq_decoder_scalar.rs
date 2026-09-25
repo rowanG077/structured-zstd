@@ -1,9 +1,6 @@
-//! Scalar-tier monolithic sequence-section decoder.
-//!
-//! Same shape as the AVX2 / BMI2 / VBMI2 monoliths: `macro_rules!`
-//! blocks expand decode + execute bodies textually at every callsite
-//! inside one function. No target_feature; portable arithmetic and
-//! libc memmove fallback in the match-copy path.
+//! Portable sequence-section decoder: the scalar entry point plus the shared
+//! body the Scalar, NEON, SVE and BMI2 tiers all run. It is generic over the
+//! kernel, so the BMI2 entry inlines it under its own `target_feature`.
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
@@ -142,12 +139,9 @@ pub(super) unsafe fn decode_resolved<K: CpuKernel>(
 /// `SUPPORTS_INLINE_SEQUENCE_EXEC` (FlatBuf / UserSliceBackend, on every
 /// target) and falls back to `try_push` + `repeat_lookahead_prefetched`
 /// otherwise (RingBuffer, or when the per-sequence literal-slack /
-/// prefix-resident gate fails). The Scalar tier is the production
-/// dispatch target on non-x86 ISAs (i686 / riscv / wasm resolve to
-/// `CpuKernelTag::Scalar`), so routing here is what makes those targets
-/// actually reach the inline path — not just the aarch64 pipelined tier.
-/// Sharing the executor keeps the literal-slack / offset gating in one
-/// place rather than duplicating it per tier.
+/// prefix-resident gate fails). Every tier that runs this body (Scalar,
+/// NEON, SVE, BMI2) reaches the inline path through it, and sharing the
+/// executor keeps the literal-slack / offset gating in one place.
 macro_rules! execute_one_body {
     (
         $buffer:expr,
@@ -328,8 +322,8 @@ pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
     )
 }
 
-// Shared scalar/BMI2 sequence algorithm. Inlining keeps the chosen kernel and
-// its bit-mask operations inside the caller's target-feature boundary.
+// Shared Scalar/NEON/SVE/BMI2 sequence algorithm. Inlining keeps the chosen
+// kernel and its bit-mask operations inside the caller's target-feature boundary.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[inline(always)]
 pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKernel>(
@@ -369,6 +363,12 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
         None => &[],
     };
 
+    // Each sequence commits its output at once, but the bitstream is only
+    // checked for exhaustion after the loop. Repcodes resolve against a shadow
+    // history committed on success. A sequence or bitstream failure restores
+    // this checkpoint when the backend can roll back, and the history is
+    // rewound only together with the output. A tail-literal overflow below
+    // returns after both are committed.
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
 
@@ -446,6 +446,8 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
 
     let remaining = br.bits_remaining();
     if remaining != 0 {
+        // Rewind the history only when the buffer rollback happened, or the
+        // workspace would pair kept output with an older history.
         if buffer.try_restore_checkpoint(buffer_checkpoint) {
             *offset_hist = saved_offset_hist;
         }
@@ -458,6 +460,10 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
         .into());
     }
 
+    // Tail literals go through `try_push`, so an overshoot on the fixed-size
+    // backend is an `OutputBufferOverflow`, not a panic. The per-block ceiling
+    // is not re-checked: it bounds match writes, and the literals section was
+    // already held to the block maximum when it was parsed.
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..literals_buffer_len];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
@@ -473,29 +479,4 @@ pub(super) fn decode_and_execute_sequences_impl<'fse, B: BufferBackend, K: CpuKe
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn nonzero_reads_match_general_reader_at_every_bit_position() {
-        let source = [
-            0x13, 0xe7, 0x82, 0x40, 0xf1, 0x39, 0xab, 0x6c, 0x9d, 0x05, 0xd2, 0x71, 0xfe, 0x48,
-            0x36, 0xb0,
-        ];
-        for width in 1..=31 {
-            for consumed in 0..=64 - width {
-                let mut fast = BitReaderReversed::<ScalarKernel>::new(&source);
-                let mut reference = BitReaderReversed::<ScalarKernel>::new(&source);
-                fast.refill();
-                reference.refill();
-                fast.consume(consumed);
-                reference.consume(consumed);
-                assert_eq!(
-                    u64::from(read_additional_bits(&mut fast, width)),
-                    reference.get_bits_unchecked(width)
-                );
-                assert_eq!(fast.bits_remaining(), reference.bits_remaining());
-            }
-        }
-    }
-}
+mod tests;
