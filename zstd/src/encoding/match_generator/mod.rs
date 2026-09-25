@@ -110,7 +110,8 @@ pub(crate) const DFAST_SKIP_STEP_GROWTH_INTERVAL: usize = 1 << DFAST_SKIP_SEARCH
 /// what it scans anyway. Indexing at every sixteenth position instead cost a
 /// third of the encode on incompressible input — two tables, sixty-five
 /// thousand stores per mebibyte — for a proximity nothing needs. Fast reads the
-/// same reasoning from [`RAW_SKIP_INDEX_STEP`].
+/// same reasoning from
+/// [`RAW_SKIP_INDEX_STEP`](crate::encoding::incompressible::RAW_SKIP_INDEX_STEP).
 pub(crate) const DFAST_INCOMPRESSIBLE_SKIP_STEP: usize =
     crate::encoding::incompressible::RAW_SKIP_INDEX_STEP;
 pub(crate) const ROW_HASH_BITS: usize = 20;
@@ -179,34 +180,32 @@ mod dict_prime;
 /// number of arms, but `storage.backend()` is now the canonical source
 /// of truth and dead variants are dropped when the active backend
 /// changes.
+///
+/// The variant is chosen by the resolved search method,
+/// [`LevelParams::backend`](crate::encoding::levels::config::LevelParams::backend),
+/// never by the level number alone: the search method comes from the
+/// (level, source size) cParams row plus any parameter override, and the
+/// size tier can change it. Level 11, for one, runs lazy2 on the Row backend
+/// for a large source and btopt on the HashChain backend for 16 KiB or less.
+/// Resolve the parameters for the input before assuming which backend runs.
 #[derive(Clone)]
 enum MatcherStorage {
-    /// Upstream zstd `ZSTD_fast` family. Constructed by
-    /// [`MatchGeneratorDriver::new`] as the initial variant and
-    /// re-selected by [`Matcher::reset`] for any [`CompressionLevel`]
-    /// that `resolve_level_params` maps to [`StrategyTag::Fast`]
-    /// (`Uncompressed`, `Fastest`, `Level(1)`, and any non-positive
-    /// `Level(n)` not equal to `0`).
+    /// Upstream zstd `ZSTD_fast` family, for `SearchMethod::Fast`.
+    /// Constructed by [`MatchGeneratorDriver::new`] as the initial variant
+    /// and re-selected by [`Matcher::reset`] when that search method resolves.
     Simple(FastKernelMatcher),
-    /// Upstream zstd `ZSTD_dfast` family — two-table hash chain. Selected for
-    /// any level that resolves to [`StrategyTag::Dfast`] in
-    /// `resolve_level_params` (`Default`, `Level(0)`, `Level(2)`,
-    /// `Level(3)`).
+    /// Upstream zstd `ZSTD_dfast` family — two-table hash chain, for
+    /// `SearchMethod::DoubleFast`.
     Dfast(DfastMatchGenerator),
-    /// Upstream zstd `ZSTD_greedy` family with row hashing. Selected for any
-    /// level that resolves to [`StrategyTag::Greedy`] (currently
-    /// `Level(4)` only).
+    /// Upstream zstd `lazy_generic` parse (`ZSTD_greedy` / `ZSTD_lazy` /
+    /// `ZSTD_lazy2` / `ZSTD_btlazy2`), for `SearchMethod::RowHash` and
+    /// `SearchMethod::BinaryTreeLazy`. The Row backend itself searches a hash
+    /// chain instead of rows when the resolved window is small.
     Row(RowMatchGenerator),
-    /// Upstream zstd `ZSTD_lazy2` and the BT-based optimal modes
-    /// (`btopt` / `btultra` / `btultra2`). Selected for any level that
-    /// resolves to [`StrategyTag::Lazy`], [`StrategyTag::BtOpt`],
-    /// [`StrategyTag::BtUltra`], or [`StrategyTag::BtUltra2`]
-    /// (`Better`, `Best`, `Level(5..=22)`, and any `Level(n)` with
-    /// `n > MAX_LEVEL` — `resolve_level_params` clamps positive
-    /// numeric levels at `MAX_LEVEL = 22` via
-    /// `Level(n).clamp(1, MAX_LEVEL)`, so `Level(23..=i32::MAX)` all
-    /// land on `BtUltra2` here). The [`HcMatchGenerator`]'s internal
-    /// [`HcBackend`] discriminator decides whether BT scratch is
+    /// The hash-chain matcher, for `SearchMethod::HashChain` and
+    /// `SearchMethod::BinaryTree`; the latter carries the BT-based optimal
+    /// modes (`btopt` / `btultra` / `btultra2`). The [`HcMatchGenerator`]'s
+    /// internal [`HcBackend`] discriminator decides whether BT scratch is
     /// allocated.
     HashChain(HcMatchGenerator),
 }
@@ -1013,7 +1012,7 @@ impl Matcher for MatchGeneratorDriver {
     /// is active (the caller short-circuits on `dict_active`), so this answers
     /// "could the dict compress this otherwise-incompressible-looking block?".
     /// The Simple (Fast) backend samples its dict table precisely
-    /// ([`FastKernelMatcher::block_samples_match_dict`]); the other backends
+    /// (`FastKernelMatcher::block_samples_match_dict`); the other backends
     /// (Dfast / Row / HashChain / BT) have their own dict structures and no cheap
     /// probe here, so they answer CONSERVATIVELY `true`: without a probe they
     /// cannot tell whether the dict compresses an incompressible-LOOKING block,

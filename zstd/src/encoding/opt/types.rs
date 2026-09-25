@@ -9,7 +9,9 @@
 //! Methods that operate on these types stay on `HcMatchGenerator` for
 //! now and migrate in later phases.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 use super::super::cost_model::HcOptimalCostProfile;
 
@@ -27,7 +29,7 @@ pub(crate) struct MatchCandidate {
 /// committing this cell.
 ///
 /// The running PRICE is NOT stored here: it lives solely in the parallel
-/// `node_prices: Box<[u32]>` (one `u32` per position), so the SIMD price-set
+/// `node_prices` array (one `u32` per position), so the SIMD price-set
 /// can vector-load consecutive prices and there is a SINGLE source of truth for
 /// each price (no AoS/SoA duplication to keep in lockstep).
 #[derive(Copy, Clone, Debug)]
@@ -70,7 +72,7 @@ pub(crate) struct HcCandidateQuery {
 }
 
 /// Per-frame DP state captured at the start of `build_optimal_plan_impl`:
-/// the rep history to use as opt[0], the initial literal-run length, and
+/// the rep history to use as `opt[0]`, the initial literal-run length, and
 /// the cost-model profile picked for the current strategy.
 #[derive(Copy, Clone)]
 pub(crate) struct HcOptimalPlanState {
@@ -92,11 +94,21 @@ pub(crate) struct HcOptimalPlanState {
 /// checker can split the matcher's fields without macro-level
 /// scaffolding.
 pub(crate) struct HcOptimalPlanBuffers {
-    pub(crate) nodes: alloc::boxed::Box<[HcOptimalNode]>,
+    /// DP cells, `HC_OPT_NODE_LEN` of them and never filled up front, like
+    /// upstream zstd's workspace-carved `opt` array. A node is written only by
+    /// the transition that makes its cell reachable, and read only while its
+    /// price in [`Self::node_prices`] is finite, so unreached cells are never
+    /// touched.
+    pub(crate) nodes: Box<[MaybeUninit<HcOptimalNode>]>,
     /// SoA price companion to `nodes` (see `BtMatcher::opt_node_prices_scratch`):
     /// `node_prices[i]` mirrors node `i`'s running DP price as a contiguous
     /// `u32` so the inner price-set loop can SIMD-compare a run of node prices.
-    pub(crate) node_prices: alloc::boxed::Box<[u32]>,
+    /// Each call writes a price (seed, [`BtMatcher::reset_opt_node_prices`], or
+    /// a match / literal update) before it reads it; `u32::MAX` marks a cell
+    /// the frontier reaches but no transition does.
+    ///
+    /// [`BtMatcher::reset_opt_node_prices`]: crate::encoding::bt::BtMatcher::reset_opt_node_prices
+    pub(crate) node_prices: Box<[MaybeUninit<u32>]>,
     pub(crate) candidates: Vec<MatchCandidate>,
     pub(crate) store: Vec<HcOptimalNode>,
     /// Single backing allocation for the LL/ML price caches as `[price,
@@ -107,7 +119,7 @@ pub(crate) struct HcOptimalPlanBuffers {
     /// code keeps each cache probe on one line. Fixed stride (not
     /// `frontier_limit`-dependent) so the generation stamps land in the
     /// same cell across calls with different frontiers.
-    pub(crate) price_arena: alloc::boxed::Box<[[u32; 2]]>,
+    pub(crate) price_arena: Box<[[u32; 2]]>,
     /// `(position, literal length)` the candidates in [`Self::candidates`] were
     /// searched for, when they are still the answer to that exact query.
     ///

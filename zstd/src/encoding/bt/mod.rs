@@ -17,7 +17,9 @@
 
 #![allow(dead_code)]
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
 #[cfg(feature = "ldm")]
@@ -41,17 +43,18 @@ pub(crate) struct BtMatcher {
     /// Upstream zstd `optStatePtr_t` — Huffman / FSE-derived literal and
     /// sequence-symbol cost tables that drive the optimal parser.
     pub(crate) opt_state: HcOptState,
-    /// Per-frame scratch for the optimal-parse node stream. Fixed-size
-    /// boxed slice (no `cap` field, no in-parse `resize`/realloc) sized to
-    /// `HC_OPT_NODE_LEN`, mirroring upstream zstd's fixed `opt[ZSTD_OPT_NUM]`.
-    pub(crate) opt_nodes_scratch: alloc::boxed::Box<[HcOptimalNode]>,
+    /// Per-frame scratch for the optimal-parse node stream: `HC_OPT_NODE_LEN`
+    /// cells allocated once and never filled, like upstream zstd's
+    /// workspace-carved `opt[ZSTD_OPT_NUM]`. The DP never reads a cell it has
+    /// not written in the same call (see [`HcOptimalPlanBuffers::nodes`]).
+    pub(crate) opt_nodes_scratch: Box<[MaybeUninit<HcOptimalNode>]>,
     /// SoA companion to `opt_nodes_scratch`: the running DP price for each
     /// node, split out of `HcOptimalNode` into its own contiguous `u32`
     /// array so the optimal-parser inner price-set loop can SIMD-compare a
     /// run of consecutive node prices with a single vector load (the 28-byte
     /// AoS node stride would otherwise force a strided gather). Same length
     /// as `opt_nodes_scratch`; index `i` is the price of node `i`.
-    pub(crate) opt_node_prices_scratch: alloc::boxed::Box<[u32]>,
+    pub(crate) opt_node_prices_scratch: Box<[MaybeUninit<u32>]>,
     /// Per-frame scratch for collected match candidates.
     pub(crate) opt_candidates_scratch: Vec<MatchCandidate>,
     /// Per-frame scratch for the final emitted node stream.
@@ -158,8 +161,8 @@ impl BtMatcher {
             // Empty boxed slices: no allocation until the optimal parser
             // first runs (non-BT strategies never touch these), matching
             // the prior lazy `Vec::new()` + grow behaviour.
-            opt_nodes_scratch: alloc::boxed::Box::default(),
-            opt_node_prices_scratch: alloc::boxed::Box::default(),
+            opt_nodes_scratch: Box::default(),
+            opt_node_prices_scratch: Box::default(),
             opt_candidates_scratch: Vec::new(),
             opt_store_scratch: Vec::new(),
             opt_segment_plan_scratch: Vec::new(),
@@ -200,10 +203,10 @@ impl BtMatcher {
     /// drops cached price stamps.
     pub(crate) fn reset(&mut self) {
         self.opt_state.reset();
-        // The fixed-size `opt_nodes_scratch` / `opt_price_arena` boxed
-        // slices persist across resets (no realloc churn). Per-block
-        // correctness comes from the DP re-initialising the node frontier
-        // it reads and from the generation stamps marking stale price
+        // The `opt_nodes_scratch` / `opt_node_prices_scratch` /
+        // `opt_price_arena` boxed slices persist across resets (no realloc
+        // churn). Per-block correctness comes from the DP reading only DP
+        // cells it wrote in the same call and from the generation stamps marking stale price
         // cells. The LL/ML stamps stay MONOTONIC across resets (never
         // zeroed): stale generation cells in the persistent arena carry
         // older, smaller stamps and so can never falsely match the next
@@ -305,7 +308,7 @@ impl BtMatcher {
 
     /// Upstream zstd parity: `ZSTD_optLdm_maybeAddMatch`. Convert the active LDM
     /// window (open/close cursors set by
-    /// [`ldm_get_next_match_and_update_seq_store`]) into a usable
+    /// [`Self::ldm_get_next_match_and_update_seq_store`]) into a usable
     /// `MatchCandidate` when the current position falls inside it.
     pub(crate) fn ldm_maybe_add_match(
         &self,
@@ -333,7 +336,7 @@ impl BtMatcher {
     }
 
     /// Upstream zstd parity: `ZSTD_optLdm_processMatchCandidate`. Wraps
-    /// [`ldm_maybe_add_match`] with a re-seed step when the parser has
+    /// [`Self::ldm_maybe_add_match`] with a re-seed step when the parser has
     /// stepped past the current LDM window.
     pub(crate) fn ldm_process_match_candidate(
         &self,
@@ -612,27 +615,20 @@ impl BtMatcher {
         opt_state.set_base_prices(accurate);
     }
 
+    /// Brings cells `start..=end` into the frontier as unreached: price `MAX`.
+    /// Their nodes are left untouched, possibly uninitialised: the DP reads a
+    /// node only once its price is finite, and every transition that makes a
+    /// price finite writes the whole node with it.
+    ///
+    /// # Safety
+    ///
+    /// `node_prices` points into an arena longer than `end`.
     #[inline(always)]
-    pub(crate) fn reset_opt_nodes(
-        nodes: &mut [HcOptimalNode],
-        node_prices: &mut [u32],
-        start: usize,
-        end: usize,
-    ) {
-        for node in &mut nodes[start..=end] {
-            Self::reset_opt_node(node);
+    pub(crate) unsafe fn reset_opt_node_prices(node_prices: *mut u32, start: usize, end: usize) {
+        for i in start..=end {
+            // SAFETY: `i <= end`, in bounds by the caller's contract.
+            unsafe { node_prices.add(i).write(u32::MAX) };
         }
-        for price in &mut node_prices[start..=end] {
-            *price = u32::MAX;
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn reset_opt_node(node: &mut HcOptimalNode) {
-        // Price is reset separately via `node_prices` (see `reset_opt_nodes`);
-        // here we only mark the slot not end-of-match. Upstream zstd parity: stale mlen
-        // is ignored while the (separately-held) price is MAX and litlen != 0.
-        node.litlen = u32::MAX;
     }
 
     #[inline(always)]

@@ -923,9 +923,10 @@ impl RingBuffer {
 }
 
 impl super::buffer_backend::BufferBackend for RingBuffer {
-    // The ring supports the inline `ZSTD_execSequence` body, but only on the
-    // contiguous (non-wrapped) sub-window — `inline_exec_ok` gates it and the
-    // caller falls back to the wrap-correct `push` / `repeat` path otherwise.
+    // The ring supports the inline `ZSTD_execSequence` body wherever the
+    // sequence is one contiguous in-bounds run, unwrapped or wrapped —
+    // `inline_exec_ok` gates it and the caller falls back to the wrap-correct
+    // `push` / `repeat` path otherwise.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
     #[inline(always)]
@@ -949,8 +950,9 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         //   + overshoot ends strictly before `head` (so it neither wraps nor
         //   clobbers the upper live segment) and (b) the match source does not
         //   underflow into that upper segment: `offset <= tail + lit` keeps
-        //   `tail + lit - offset >= 0`, placing the source in the contiguous
-        //   lower live segment `[0, tail)`. Sequences violating either bound
+        //   `tail + lit - offset >= 0`, so the source is either this
+        //   sequence's own literals (`offset <= lit`) or the contiguous lower
+        //   live segment `[0, tail)`. Sequences violating either bound
         //   (a far-back match across the wrap, or a write that reaches `head`)
         //   fall back to the wrap-correct `push` / `repeat` path. This is the
         //   subset upstream zstd handles with its fast `ZSTD_execSequence` body;
@@ -961,7 +963,7 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         // condition that separates the two: where the match source comes from.
         // Unwrapped, the caller's `offset <= live + lit` invariant already puts
         // it at `>= head`; wrapped, `offset <= tail + lit` keeps
-        // `tail + lit - offset >= 0`, in the contiguous lower live segment.
+        // `tail + lit - offset >= 0`, in this sequence's literals or below them.
         self.inline_exec_dict_ok(lit_length, match_length)
             && (self.head <= self.tail || offset <= self.tail + lit_length)
     }
@@ -1017,11 +1019,24 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         }
     }
 
-    /// Inline `ZSTD_execSequence` fast path on the contiguous sub-window. Gated by
-    /// [`Self::inline_exec_ok`]: `head <= tail` and the write + 15-byte
-    /// overshoot stay below `cap`, so the linear addressing the FlatBuf body
-    /// uses is valid for the ring too. Mirrors `FlatBuf::exec_sequence_inline`
-    /// with `tail`/`cap`/the ring base in place of the Vec.
+    /// Inline `ZSTD_execSequence` fast path on a contiguous run of the ring,
+    /// addressed linearly from `tail` the way the FlatBuf body addresses its
+    /// Vec. Gated by
+    /// [`BufferBackend::inline_exec_ok`](super::buffer_backend::BufferBackend::inline_exec_ok),
+    /// which admits two layouts, each with a 31-byte margin past the write:
+    ///
+    /// - unwrapped (`head <= tail`): the write plus margin stays below `cap`;
+    /// - wrapped (`head > tail`): the write plus margin stays below `head`, and
+    ///   `offset <= tail + lit_length` keeps the source address
+    ///   `tail + lit_length - offset` nonnegative: it lies in this sequence's
+    ///   own literals when `offset <= lit_length`, otherwise in the lower live
+    ///   segment `[0, tail)`.
+    ///
+    /// The body itself overshoots by at most 15 bytes, which
+    /// `sequence_output_fits` re-checks against `cap`; the gate's wider margin
+    /// is the AVX2 body's 31-byte overshoot, so one gate serves both bodies. Mirrors
+    /// `FlatBuf::exec_sequence_inline` with `tail`/`cap`/the ring base in place
+    /// of the Vec.
     #[cfg(target_arch = "x86_64")]
     #[inline]
     unsafe fn exec_sequence_inline(
@@ -1044,7 +1059,8 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         debug_assert!(match_length >= 1);
         // `inline_exec_ok` admits both the unwrapped run (`head <= tail`) and a
         // wrapped ring whose write stays in the gap before `head` and whose
-        // match source is the contiguous lower segment (`offset <= tail+lit`).
+        // match source stays at or above 0 (`offset <= tail+lit`: this
+        // sequence's literals or the contiguous lower segment below them).
         // The match-source contiguity bound differs per case; assert the one
         // that applies so a future caller bypassing the gate is caught.
         debug_assert!(
@@ -1078,7 +1094,7 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         Ok(())
     }
 
-    /// Non-x86 port of [`Self::exec_sequence_inline`] — portable u128 / u64
+    /// Non-x86 arm of `exec_sequence_inline` — portable u128 / u64
     /// wildcopy helpers (NEON `ldr q`/`str q` on aarch64). Same contiguity
     /// contract as the x86 arm.
     #[cfg(not(target_arch = "x86_64"))]
