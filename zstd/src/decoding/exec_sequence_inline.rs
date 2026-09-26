@@ -191,6 +191,42 @@ macro_rules! exec_sequence_avx2_inline_at {
                     wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
                 } else if offset_v >= 16 {
                     wildcopy_no_overlap(op_match, match_src, match_length_v);
+                } else if tail + lit_length_v >= 16 {
+                    // The preceding sixteen bytes are initialized: they are
+                    // earlier output followed by the literals just copied.
+                    // Reading this window avoids both an uninitialized read
+                    // past op_match and the byte-store dependency chain of
+                    // overlap_copy8. Every shuffle lane selects one of the
+                    // last offset_v bytes, repeating that match period.
+                    const MASKS: [[u8; 16]; 16] = {
+                        let mut result = [[0u8; 16]; 16];
+                        let mut offset = 1;
+                        while offset < 16 {
+                            let mut i = 0;
+                            while i < 16 {
+                                result[offset][i] = (16 - offset + i % offset) as u8;
+                                i += 1;
+                            }
+                            offset += 1;
+                        }
+                        result
+                    };
+                    use core::arch::x86_64::{_mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
+                    // The branch places op_match - 16 inside the allocation.
+                    // The enclosing runtime AVX2 tier also supports SSSE3.
+                    let data = _mm_loadu_si128(op_match.sub(16).cast());
+                    let mask = _mm_loadu_si128(MASKS.as_ptr().add(offset_v).cast());
+                    _mm_storeu_si128(op_match.cast(), _mm_shuffle_epi8(data, mask));
+                    if match_length_v > 16 {
+                        // Resume the existing overlap copier at the same
+                        // phase sixteen bytes into the repeated match. Its
+                        // first eight bytes precede the remaining wildcopy.
+                        let (op2, ip2) =
+                            overlap_copy8(op_match.add(16), match_src.add(16), offset_v);
+                        if match_length_v > 24 {
+                            wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 24);
+                        }
+                    }
                 } else {
                     let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
                     if match_length_v > 8 {

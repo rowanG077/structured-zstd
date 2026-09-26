@@ -152,3 +152,80 @@ fn overlap_copy8_offset_lt_8_spreads_source() {
     // contract).
     assert!(buf[3..11].iter().any(|&b| b != 0));
 }
+
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn avx2_short_offset_prefix_boundaries() {
+    if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2")) {
+        return;
+    }
+    #[target_feature(enable = "bmi2,avx2")]
+    unsafe fn run(
+        out: *mut u8,
+        tail: usize,
+        cap: usize,
+        literals: &[u8],
+        ll: usize,
+        ml: usize,
+        offset: usize,
+    ) {
+        let cap_w = if cap >= super::MAX_WILDCOPY_OVERSHOOT {
+            cap - super::MAX_WILDCOPY_OVERSHOOT
+        } else {
+            0
+        };
+        let written = super::exec_sequence_avx2_inline_at!(
+            out,
+            tail,
+            cap,
+            cap_w,
+            literals.as_ptr(),
+            ll,
+            offset,
+            ml
+        )
+        .unwrap();
+        assert_eq!(written, ll + ml);
+    }
+    for tail in 0..=32 {
+        for ll in [0, 1, 15, 16, 17, 31, 32, 33] {
+            let literals: alloc::vec::Vec<u8> = (0..ll + crate::WILDCOPY_OVERLENGTH)
+                .map(|i| (i * 19 + 7) as u8)
+                .collect();
+            for offset in 1..=15 {
+                if offset > tail + ll {
+                    continue;
+                }
+                for ml in [
+                    3, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 63, 64, 65, 128,
+                ] {
+                    let mut expected: alloc::vec::Vec<u8> =
+                        (0..tail).map(|i| (i * 13 + 5) as u8).collect();
+                    expected.extend_from_slice(&literals[..ll]);
+                    for _ in 0..ml {
+                        expected.push(expected[expected.len() - offset]);
+                    }
+                    for slack in [0, 1, 15, 30, 31, 32, 63] {
+                        let cap = expected.len() + slack;
+                        // Leave spare capacity uninitialized, as FlatBuf does.
+                        // Only the actual prefix and post-cap canary are initialized.
+                        let mut out = alloc::vec::Vec::<u8>::with_capacity(cap + 32);
+                        out.extend_from_slice(&expected[..tail]);
+                        unsafe {
+                            out.as_mut_ptr().add(cap).write_bytes(0xCD, 32);
+                            run(out.as_mut_ptr(), tail, cap, &literals, ll, ml, offset);
+                            out.set_len(expected.len());
+                        }
+                        assert_eq!(
+                            out, expected,
+                            "tail={tail}, ll={ll}, ml={ml}, offset={offset}, slack={slack}"
+                        );
+                        let canary =
+                            unsafe { core::slice::from_raw_parts(out.as_ptr().add(cap), 32) };
+                        assert!(canary.iter().all(|&v| v == 0xCD));
+                    }
+                }
+            }
+        }
+    }
+}
