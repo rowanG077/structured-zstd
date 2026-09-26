@@ -216,6 +216,11 @@ fn main() {
         }
     }
     let elapsed = start.elapsed();
+    // Validate the timed bulk decoder's bytes outside the measured interval.
+    // A fast decode that returns a plausible length is not a valid benchmark.
+    if iters != 0 && mode != "stream" {
+        assert_eq!(&target[..n], src.as_slice(), "decoded bytes differ");
+    }
     eprintln!(
         "decoded {} iters, {} total bytes, {:?} wall, {:.0} ns/iter ({})",
         iters,

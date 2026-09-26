@@ -76,6 +76,29 @@ Follow-up implementation issue: [#108](https://github.com/structured-world/struc
 
 ## Commands
 
+On x86-64 Linux, enter the pinned Nix development shell:
+
+```bash
+nix develop
+```
+
+The shell includes stable Rust, `cargo asm` (cargo-show-asm), `cargo llvm-lines`,
+`cargo bloat`, `cargo flamegraph`, LLVM tools (including `llvm-mca`), `perf`,
+Valgrind, GDB, Hyperfine, and `taskset`. It preserves the workspace's build
+profiles and CPU baseline so normal builds exercise runtime SIMD dispatch.
+
+Compare Rust and upstream C decompression in the same harness:
+
+```bash
+cargo bench -p ffi-bench --bench compare_ffi -- decompress/
+```
+
+For profiling with debug symbols, use the existing `flamegraph` profile:
+
+```bash
+cargo flamegraph --profile flamegraph -p ffi-bench --bench compare_ffi -- decompress/default/decodecorpus-z000033/rust_stream/matrix/pure_rust
+```
+
 Run the full Criterion matrix:
 
 ```bash
