@@ -87,6 +87,9 @@ The shell includes stable Rust, `cargo asm` (cargo-show-asm), `cargo llvm-lines`
 Valgrind, GDB, Hyperfine, and `taskset`. It preserves the workspace's build
 profiles and CPU baseline so normal builds exercise runtime SIMD dispatch.
 
+Local x86-64 measurements and rejected rewrite experiments are recorded in
+[the decode performance report](docs/x64-decode-performance.md).
+
 Compare Rust and upstream C decompression in the same harness:
 
 ```bash

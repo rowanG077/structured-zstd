@@ -20,6 +20,7 @@ use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::exec_sequence_inline::{
     MAX_WILDCOPY_OVERSHOOT, exec_sequence_avx2_dict_inline, exec_sequence_avx2_inline_at,
+    exec_sequence_avx2_inline_ptr,
 };
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
@@ -96,7 +97,8 @@ macro_rules! decode_one_body {
 /// asked through `&mut` after a write is a reload the optimiser cannot hoist.
 /// The cold paths still own the buffer, so they publish this cursor before
 /// running and take it back afterwards.
-struct OutCursor {
+#[derive(Default)]
+struct IndexedOutCursor {
     /// Start of the linear output. Null when the backend has no inline path,
     /// where it is never read.
     base: *mut u8,
@@ -122,7 +124,7 @@ struct OutCursor {
     live_base: core::num::Wrapping<usize>,
 }
 
-impl OutCursor {
+impl IndexedOutCursor {
     /// Take the buffer's position into locals.
     #[inline(always)]
     fn capture<B: BufferBackend>(buffer: &mut DecodeBuffer<B>) -> Self {
@@ -171,6 +173,148 @@ impl OutCursor {
             unsafe { buffer.buffer_mut().inline_exec_commit(self.op) };
         }
     }
+}
+
+/// A stable linear backend carries addresses, so the sequence loop never
+/// keeps an allocation base merely to convert each output index back to a
+/// pointer. The integer cursor exists only in the RingBuffer monomorph: every
+/// selection below uses backend constants, and the inactive fields are dead.
+/// No runtime selector or second coordinate system enters either hot loop.
+struct OutCursor {
+    op: *mut u8,
+    prefix: *mut u8,
+    wild_end: *mut u8,
+    indexed: IndexedOutCursor,
+}
+
+impl OutCursor {
+    #[inline(always)]
+    fn capture<B: BufferBackend>(buffer: &mut DecodeBuffer<B>) -> Self {
+        if B::CURSOR_IS_BLOCK_STABLE && B::SUPPORTS_INLINE_SEQUENCE_EXEC {
+            let live = buffer.len();
+            let backend = buffer.buffer_mut();
+            let tail = backend.tail();
+            let limit = backend.inline_write_limit();
+            debug_assert!(live <= tail);
+            debug_assert!(tail <= limit);
+            debug_assert!(limit <= isize::MAX as usize);
+            // Saturation deliberately leaves no wildcopy room when even its
+            // overshoot exceeds the whole output. A positive sequence length
+            // then always takes the exact-copy branch.
+            let wild_limit = limit.saturating_sub(MAX_WILDCOPY_OVERSHOOT);
+            // SAFETY: stable inline backends are UserSlice and FlatBuf. Their
+            // live bytes are the one allocation's [tail-live, tail), and their
+            // write limit is at most its capacity. Rust slices and Vec<u8>
+            // allocations are at most isize::MAX bytes. All three addresses
+            // therefore stay within that allocation, including one-past-end.
+            // Re-capture after every backend fallback, which may relocate it.
+            unsafe {
+                let base = backend.inline_exec_base_ptr();
+                Self {
+                    op: base.add(tail),
+                    prefix: base.add(tail - live),
+                    wild_end: base.add(wild_limit),
+                    indexed: IndexedOutCursor::default(),
+                }
+            }
+        } else {
+            Self {
+                op: core::ptr::null_mut(),
+                prefix: core::ptr::null_mut(),
+                wild_end: core::ptr::null_mut(),
+                indexed: IndexedOutCursor::capture(buffer),
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn live<B: BufferBackend>(&self) -> usize {
+        if B::CURSOR_IS_BLOCK_STABLE && B::SUPPORTS_INLINE_SEQUENCE_EXEC {
+            // SAFETY: capture establishes same-allocation provenance and
+            // prefix <= op. Inline copies only advance op within its limit.
+            unsafe { self.op.offset_from(self.prefix) as usize }
+        } else {
+            self.indexed.live()
+        }
+    }
+
+    #[inline(always)]
+    fn advance<B: BufferBackend>(&mut self, total: usize) {
+        if B::CURSOR_IS_BLOCK_STABLE && B::SUPPORTS_INLINE_SEQUENCE_EXEC {
+            // SAFETY: successful execution proved this sequence fits the
+            // same allocation, either including wildcopy slack or exactly.
+            self.op = unsafe { self.op.add(total) };
+        } else {
+            self.indexed.op += total;
+        }
+    }
+
+    #[inline(always)]
+    fn publish<B: BufferBackend>(&self, buffer: &mut DecodeBuffer<B>) {
+        if B::CURSOR_IS_BLOCK_STABLE && B::SUPPORTS_INLINE_SEQUENCE_EXEC {
+            let backend = buffer.buffer_mut();
+            // SAFETY: no backend mutation occurs while its cursor is carried.
+            // After any fallback capture refreshes the allocation provenance.
+            // Every byte below op is initialized; convert to the physical
+            // index only here, outside the inline sequence path.
+            unsafe {
+                let base = backend.inline_exec_base_ptr();
+                let tail = self.op.offset_from(base) as usize;
+                debug_assert!(tail <= backend.inline_write_limit());
+                backend.inline_exec_commit(tail);
+            }
+        } else {
+            self.indexed.publish(buffer);
+        }
+    }
+}
+
+/// Exact-tail path for the pointer cursor. Reconstruct backend coordinates
+/// only when a sequence has insufficient wildcopy slack; they are not live
+/// in the hot loop. On overflow this preserves the existing physical-tail
+/// error and leaves both cursor and backend unchanged.
+///
+/// UserSlice may reborrow its output when obtaining the fresh base below.
+/// A successful call necessarily advances op beyond the fixed wild_end, so
+/// every later sequence remains on this exact path: the retained old cursor
+/// pointers are used only for address arithmetic, never dereferenced again.
+/// Each exact copy uses the fresh base. Any backend fallback re-captures the
+/// cursor before inline writes resume; an error ends the sequence pipeline.
+#[cold]
+#[inline(never)]
+unsafe fn execute_sequence_pointer_bounded<B: BufferBackend>(
+    buffer: &mut DecodeBuffer<B>,
+    op: *mut u8,
+    lit_src: *const u8,
+    lit_length: usize,
+    offset: usize,
+    match_length: usize,
+) -> Result<usize, ExecuteSequencesError> {
+    let backend = buffer.buffer_mut();
+    // SAFETY: the carried op belongs to this unchanged allocation. The caller
+    // already validated the match offset against live output plus literals.
+    let base = unsafe { backend.inline_exec_base_ptr() };
+    let tail = unsafe { op.offset_from(base) as usize };
+    let total = super::buffer_backend::sequence_output_fits(
+        lit_length,
+        match_length,
+        tail,
+        backend.inline_write_limit(),
+        0,
+    )?;
+    // SAFETY: the capacity check preceded all arithmetic for the new output.
+    // The exact copier never accesses outside the validated sequence range.
+    unsafe {
+        super::exec_sequence_inline::exec_sequence_bounded_copy(
+            base,
+            tail,
+            lit_src,
+            lit_length,
+            offset,
+            match_length,
+        );
+    }
+    Ok(total)
 }
 
 /// Slow sequence path shared by the AVX2 monolith's two rejection branches.
@@ -274,10 +418,10 @@ macro_rules! execute_one_body {
             // says so rather than a release build wrapping into a wrong
             // prefix-resident answer.
             debug_assert!(
-                $cur.live().checked_add(lits.len()).is_some(),
+                $cur.live::<B>().checked_add(lits.len()).is_some(),
                 "live output plus the literal run must not wrap",
             );
-            let prefix_resident = offset <= $cur.live() + lits.len();
+            let prefix_resident = offset <= $cur.live::<B>() + lits.len();
 
             // `inline_exec_ok` lets a wrapping backend (RingBuffer) veto the
             // inline path when the live region is not contiguous at `tail`;
@@ -304,19 +448,32 @@ macro_rules! execute_one_body {
                     // Inline the AVX2 exec body at the call site (no trait-method
                     // call boundary; see `exec_sequence_avx2_inline`), addressed
                     // by the cursor this loop carries.
-                    let r = exec_sequence_avx2_inline_at!(
-                        $cur.base,
-                        $cur.op,
-                        $cur.cap,
-                        $cur.cap_w,
-                        lit_src,
-                        seq_ll_v as usize,
-                        offset,
-                        seq_ml_v as usize
-                    );
+                    let r = if B::CURSOR_IS_BLOCK_STABLE {
+                        exec_sequence_avx2_inline_ptr!(
+                            $buffer,
+                            $cur.op,
+                            $cur.wild_end,
+                            $cur.prefix,
+                            lit_src,
+                            seq_ll_v as usize,
+                            offset,
+                            seq_ml_v as usize
+                        )
+                    } else {
+                        exec_sequence_avx2_inline_at!(
+                            $cur.indexed.base,
+                            $cur.indexed.op,
+                            $cur.indexed.cap,
+                            $cur.indexed.cap_w,
+                            lit_src,
+                            seq_ll_v as usize,
+                            offset,
+                            seq_ml_v as usize
+                        )
+                    };
                     match r {
                         Ok(total) => {
-                            $cur.op += total;
+                            $cur.advance::<B>(total);
                             // A wrapping backend has to see the write now, so
                             // its commit can normalise the wrap before the next
                             // sequence asks the gate above.
@@ -668,3 +825,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     );
     Ok(())
 }
+
+#[cfg(all(test, feature = "std"))]
+mod tests;

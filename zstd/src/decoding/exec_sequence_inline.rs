@@ -91,6 +91,91 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
     }
 }
 
+/// One copy schedule for the indexed and pointer-coordinate AVX2 executors.
+/// Bounds and exact tails remain in their respective wrappers. This is a
+/// textual macro, so sharing the schedule adds no function-call boundary.
+///
+/// The prefix-window argument stays an expression: it is evaluated only in
+/// the short-offset branch, after literal copying. In particular, the pointer
+/// cursor must not carry a duplicate numeric prefix length through that copy.
+///
+/// # Safety
+/// The enclosing function supports AVX2 (and therefore SSSE3). The wrappers
+/// provide valid output and literal pointers plus 31 writable/readable bytes
+/// of trailing slack. The match offset is nonzero and reaches initialized
+/// output, including the literals copied here. A true prefix-window expression
+/// must prove that the sixteen bytes immediately before op_match are both
+/// inside the allocation and initialized.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+macro_rules! exec_sequence_avx2_wildcopy {
+    ($op_lit:ident, $op_match:ident, $match_src:ident, $lit_src:ident, $lit_length:ident, $offset:ident, $match_length:ident, $prefix_window:expr) => {{
+        use crate::decoding::exec_sequence_inline::x86::{
+            copy16, copy32_avx2, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+            wildcopy_overlap_8byte_stride,
+        };
+        // Literals carry the same 32-byte trailing slack as the
+        // destination, so the AVX2 stride is sound here too. Keep
+        // the SSE2 copy for the common tiny literal run; once a run
+        // crosses 16 bytes, a 32-byte head + 32-byte tail halves the
+        // number of load/store pairs versus the 16-byte copier.
+        if $lit_length > 16 {
+            copy32_avx2($op_lit, $lit_src);
+            if $lit_length > 32 {
+                wildcopy_no_overlap_avx2($op_lit.add(32), $lit_src.add(32), $lit_length - 32);
+            }
+        } else {
+            copy16($op_lit, $lit_src);
+        }
+        if $offset >= 32 {
+            wildcopy_no_overlap_avx2($op_match, $match_src, $match_length);
+        } else if $offset >= 16 {
+            wildcopy_no_overlap($op_match, $match_src, $match_length);
+        } else if $prefix_window {
+            // The preceding sixteen bytes are initialized: they are
+            // earlier output followed by the literals just copied.
+            // Reading this window avoids both an uninitialized read
+            // past $op_match and the byte-store dependency chain of
+            // overlap_copy8. Every shuffle lane selects one of the
+            // last $offset bytes, repeating that match period.
+            const MASKS: [[u8; 16]; 16] = {
+                let mut result = [[0u8; 16]; 16];
+                let mut offset = 1;
+                while offset < 16 {
+                    let mut i = 0;
+                    while i < 16 {
+                        result[offset][i] = (16 - offset + i % offset) as u8;
+                        i += 1;
+                    }
+                    offset += 1;
+                }
+                result
+            };
+            use core::arch::x86_64::{_mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
+            // The branch places $op_match - 16 inside the allocation.
+            // The enclosing runtime AVX2 tier also supports SSSE3.
+            let data = _mm_loadu_si128($op_match.sub(16).cast());
+            let mask = _mm_loadu_si128(MASKS.as_ptr().add($offset).cast());
+            _mm_storeu_si128($op_match.cast(), _mm_shuffle_epi8(data, mask));
+            if $match_length > 16 {
+                // Resume the existing overlap copier at the same
+                // phase sixteen bytes into the repeated match. Its
+                // first eight bytes precede the remaining wildcopy.
+                let (op2, ip2) = overlap_copy8($op_match.add(16), $match_src.add(16), $offset);
+                if $match_length > 24 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, $match_length - 24);
+                }
+            }
+        } else {
+            let (op2, ip2) = overlap_copy8($op_match, $match_src, $offset);
+            if $match_length > 8 {
+                wildcopy_overlap_8byte_stride(op2, ip2, $match_length - 8);
+            }
+        }
+    }};
+}
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+pub(crate) use exec_sequence_avx2_wildcopy;
+
 /// Textual expansion of the AVX2 `ZSTD_execSequence` body at the call site,
 /// fusing the match-copy into a per-tier sequence monolith, addressed by an
 /// explicit cursor rather than by asking the backend where it is.
@@ -125,10 +210,6 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 macro_rules! exec_sequence_avx2_inline_at {
     ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
-        use crate::decoding::exec_sequence_inline::x86::{
-            copy16, copy32_avx2, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
-            wildcopy_overlap_8byte_stride,
-        };
         let lit_length_v: usize = $lit_length;
         let offset_v: usize = $offset;
         let match_length_v: usize = $match_length;
@@ -170,69 +251,16 @@ macro_rules! exec_sequence_avx2_inline_at {
                 let op_lit = base.add(tail);
                 let op_match = base.add(tail + lit_length_v);
                 let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
-                // Literals carry the same 32-byte trailing slack as the
-                // destination, so the AVX2 stride is sound here too. Keep
-                // the SSE2 copy for the common tiny literal run; once a run
-                // crosses 16 bytes, a 32-byte head + 32-byte tail halves the
-                // number of load/store pairs versus the 16-byte copier.
-                if lit_length_v > 16 {
-                    copy32_avx2(op_lit, lit_src_v);
-                    if lit_length_v > 32 {
-                        wildcopy_no_overlap_avx2(
-                            op_lit.add(32),
-                            lit_src_v.add(32),
-                            lit_length_v - 32,
-                        );
-                    }
-                } else {
-                    copy16(op_lit, lit_src_v);
-                }
-                if offset_v >= 32 {
-                    wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
-                } else if offset_v >= 16 {
-                    wildcopy_no_overlap(op_match, match_src, match_length_v);
-                } else if tail + lit_length_v >= 16 {
-                    // The preceding sixteen bytes are initialized: they are
-                    // earlier output followed by the literals just copied.
-                    // Reading this window avoids both an uninitialized read
-                    // past op_match and the byte-store dependency chain of
-                    // overlap_copy8. Every shuffle lane selects one of the
-                    // last offset_v bytes, repeating that match period.
-                    const MASKS: [[u8; 16]; 16] = {
-                        let mut result = [[0u8; 16]; 16];
-                        let mut offset = 1;
-                        while offset < 16 {
-                            let mut i = 0;
-                            while i < 16 {
-                                result[offset][i] = (16 - offset + i % offset) as u8;
-                                i += 1;
-                            }
-                            offset += 1;
-                        }
-                        result
-                    };
-                    use core::arch::x86_64::{_mm_loadu_si128, _mm_shuffle_epi8, _mm_storeu_si128};
-                    // The branch places op_match - 16 inside the allocation.
-                    // The enclosing runtime AVX2 tier also supports SSSE3.
-                    let data = _mm_loadu_si128(op_match.sub(16).cast());
-                    let mask = _mm_loadu_si128(MASKS.as_ptr().add(offset_v).cast());
-                    _mm_storeu_si128(op_match.cast(), _mm_shuffle_epi8(data, mask));
-                    if match_length_v > 16 {
-                        // Resume the existing overlap copier at the same
-                        // phase sixteen bytes into the repeated match. Its
-                        // first eight bytes precede the remaining wildcopy.
-                        let (op2, ip2) =
-                            overlap_copy8(op_match.add(16), match_src.add(16), offset_v);
-                        if match_length_v > 24 {
-                            wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 24);
-                        }
-                    }
-                } else {
-                    let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
-                    if match_length_v > 8 {
-                        wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
-                    }
-                }
+                $crate::decoding::exec_sequence_inline::exec_sequence_avx2_wildcopy!(
+                    op_lit,
+                    op_match,
+                    match_src,
+                    lit_src_v,
+                    lit_length_v,
+                    offset_v,
+                    match_length_v,
+                    tail + lit_length_v >= 16
+                );
             }
             Ok(total)
         }
@@ -240,6 +268,80 @@ macro_rules! exec_sequence_avx2_inline_at {
 }
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) use exec_sequence_avx2_inline_at;
+
+/// Pointer-coordinate twin of `exec_sequence_avx2_inline_at!` for stable
+/// linear backends. The copy schedules are deliberately identical; only the
+/// cursor representation and conservative shuffle-prefix gate differ.
+///
+/// # Safety
+/// The enclosing function carries BMI2 + AVX2. `op` and `wild_end` belong to
+/// the same output allocation; the latter is the validated write limit less
+/// 31, clamped to the allocation base. `prefix` points at the first live output
+/// byte. The caller rejects zero offsets and offsets beyond the live output
+/// plus this sequence's literals, and provides the literal-source slack
+/// required by `exec_sequence_avx2_inline_at!`.
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+macro_rules! exec_sequence_avx2_inline_ptr {
+    ($buffer:expr, $op:expr, $wild_end:expr, $prefix:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
+        let lit_length_v: usize = $lit_length;
+        let offset_v: usize = $offset;
+        let match_length_v: usize = $match_length;
+        let lit_src_v: *const u8 = $lit_src;
+        let op_lit: *mut u8 = $op;
+        let wild_end: *mut u8 = $wild_end;
+        let prefix: *mut u8 = $prefix;
+        // Both lengths originate as u32, so their sum is below isize::MAX
+        // on x86_64, even for malformed FSE input. ML is at least three by
+        // construction. Keep the proofs executable in the debug suite.
+        let total = lit_length_v + match_length_v;
+        debug_assert!(total <= isize::MAX as usize);
+        debug_assert!(match_length_v >= 3);
+        // SAFETY: capture created both pointers within one allocation of at
+        // most isize::MAX bytes. The signed distance remains well-defined
+        // even after op passes wild_end; a negative budget selects the exact
+        // tail, avoiding unsigned underflow or out-of-allocation candidate
+        // pointers. No new output pointer is formed before this bound passes.
+        let remaining = unsafe { wild_end.offset_from(op_lit) };
+        if total as isize > remaining {
+            // SAFETY: exact helper retains the validated literal/match source
+            // contracts and checks capacity before forming any new pointer.
+            unsafe {
+                $crate::decoding::seq_decoder_avx2::execute_sequence_pointer_bounded(
+                    $buffer,
+                    op_lit,
+                    lit_src_v,
+                    lit_length_v,
+                    offset_v,
+                    match_length_v,
+                )
+            }
+        } else {
+            // SAFETY: the gate proves room for every output byte plus the
+            // largest wildcopy overshoot. The caller validated the literal
+            // range before deriving lit_src and checked nonzero offset against
+            // the live prefix plus literals. Thus both op_match
+            // and match_src are in the allocation; reads reach initialized
+            // prefix bytes or bytes initialized earlier by the same LZ copy.
+            unsafe {
+                let op_match = op_lit.add(lit_length_v);
+                let match_src = op_match.cast_const().sub(offset_v);
+                $crate::decoding::exec_sequence_inline::exec_sequence_avx2_wildcopy!(
+                    op_lit,
+                    op_match,
+                    match_src,
+                    lit_src_v,
+                    lit_length_v,
+                    offset_v,
+                    match_length_v,
+                    op_match.offset_from(prefix) >= 16
+                );
+            }
+            Ok(total)
+        }
+    }};
+}
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+pub(crate) use exec_sequence_avx2_inline_ptr;
 
 /// AVX2-tier body for a sequence whose match lies wholly inside dictionary
 /// content, as selected by
