@@ -173,6 +173,27 @@ impl OutCursor {
     }
 }
 
+/// Slow sequence path shared by the AVX2 monolith's two rejection branches.
+/// Keeping the dictionary/output fallback out of the macro expansion leaves
+/// the hot prefix-resident copy path smaller and gives LLVM fewer cold values
+/// to keep live while it allocates registers for the decode loop.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn execute_sequence_fallback<B: BufferBackend>(
+    buffer: &mut DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
+    lits: &[u8],
+    offset: usize,
+    match_length: usize,
+) -> Result<(), DecompressBlockError> {
+    buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
+    buffer
+        .repeat_lookahead_prefetched(dict, offset, match_length)
+        .map_err(ExecuteSequencesError::from)?;
+    Ok(())
+}
+
 macro_rules! execute_one_body {
     (
         $cur:expr,
@@ -364,20 +385,15 @@ macro_rules! execute_one_body {
                 break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
             }
 
-            // Cold fallback.
-            let cold = 'cold: {
-                if let Err(e) = $buffer.try_push(lits) {
-                    break 'cold Err(ExecuteSequencesError::from(e).into());
-                }
-                match $buffer.repeat_lookahead_prefetched(
-                    $dict,
-                    resolved_offset_v as usize,
-                    seq_ml_v as usize,
-                ) {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(ExecuteSequencesError::from(e).into()),
-                }
-            };
+            // Cold fallback is out of line so its error construction and
+            // repeat-copy state do not enlarge the hot monolith.
+            let cold = execute_sequence_fallback(
+                $buffer,
+                $dict,
+                lits,
+                resolved_offset_v as usize,
+                seq_ml_v as usize,
+            );
             *$cur = OutCursor::capture($buffer);
             cold
         };
@@ -424,10 +440,10 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     } = init_sequence_stream::<B, Avx2Kernel>(section, source, fse, buffer, dict)?;
     // `literals_buffer` runs past the literals by the copiers' read slack, so
     // the literal count is the parameter, never the slice's length. The slack
-    // is the source-read contract of the inline copiers, which read sixteen
-    // bytes whatever the literal length and round the wildcopy up to its
-    // stride, so assert it rather than the count alone: a sequence section
-    // exists here, and the literals decoder pads whenever one does.
+    // is the source-read contract of the inline copiers, which read at least
+    // sixteen bytes and round longer literals up to a 32-byte AVX2 stride.
+    // Assert it rather than the count alone: a sequence section exists here,
+    // and the literals decoder pads whenever one does.
     let literals_buffer_len = literals_len;
     debug_assert!(
         literals_buffer.len() >= literals_len + crate::WILDCOPY_OVERLENGTH,
