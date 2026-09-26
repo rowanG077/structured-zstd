@@ -304,6 +304,25 @@ pub type FSETable = FSETableImpl<Entry, 64>;
 #[allow(dead_code)]
 pub type SeqFSETable = FSETableImpl<SeqSymbol, 512>;
 
+// For a table of 2^log states, counters lie in 1..2^(log+1).
+// The interval [2*table_size + 1, 4*table_size) is disjoint for each log.
+// Packing new_state and num_bits returns both fields with one table load.
+const FSE_TRANSITIONS: [u32; 2048] = {
+    let mut entries = [0; 2048];
+    let mut log = 0u32;
+    while log <= 9 {
+        let size = 1u32 << log;
+        let mut next = 1u32;
+        while next < 2 * size {
+            let bits = log - next.ilog2();
+            entries[(2 * size + next) as usize] = ((next << bits) - size) | (bits << 16);
+            next += 1;
+        }
+        log += 1;
+    }
+    entries
+};
+
 impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// Initialize a new empty Finite State Entropy decoding table.
     pub fn new(max_symbol: u8) -> Self {
@@ -780,62 +799,37 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // bounds-check panic instead.
         for (state_idx, &symbol) in spread[..table_size].iter().enumerate() {
             let next_state = symbol_next[symbol as usize];
-            // `next_state >= 1` by construction: upstream
-            // `read_probabilities` / `build_from_probabilities`
-            // validate that `sum(prob, treating -1 as 1) ==
-            // table_size`, which guarantees Pass 1 + Pass 2 above
-            // fully cover spread[] (no zero defaults survive
-            // `spread.resize(table_size, 0)`) and every symbol that
-            // appears in spread[] has `symbol_next[s] > 0`.
-            // `highest_bit_set(x)` returns `floor(log2(x)) + 1`.
             symbol_next[symbol as usize] = next_state + 1;
-            let high_bit = highest_bit_set(next_state);
-            // nbBits = accuracy_log - floor(log2(next_state))
-            //        = accuracy_log - (high_bit - 1)
-            //        = (accuracy_log + 1) - high_bit
-            // For -1 prob: next_state = 1, high_bit = 1, nbBits =
-            // accuracy_log.
-            // For positive prob N: next_state in N..2N-1; max
-            // next_state = 2N-1 ≤ 2*table_size - 1, max high_bit
-            // = accuracy_log + 1 (when N == table_size), nbBits = 0.
-            // So nbBits ∈ [0, accuracy_log], satisfying the
-            // unchecked-read invariant in `FSEDecoder::read_entry`.
-            let nb = (accuracy_log as u32 + 1).wrapping_sub(high_bit) as u8;
-            // FSE invariant gate: keep the explicit `nb > accuracy_log`
-            // guard for `build_from_probabilities` (public surface) so
-            // a crafted probability vector can't silently violate
-            // `new_state + (1 << nb) - 1 < table_size`. With the upstream zstd
-            // formula `nb` derives from `high_bit` which is itself
-            // bounded by the table-size invariant, but a malformed
-            // probability accumulating beyond `table_size` could push
-            // high_bit > accuracy_log + 1 and wrap `nb` to a large
-            // u8. Reject so the unchecked indexing contract holds.
-            if nb > accuracy_log {
-                // `decode.len()` is still 0 (set by `clear()` above) —
-                // no `set_len` ran, so no uninitialised entry is
-                // observable to the outer `build_decoding_table`'s
-                // `reset()` path. The partially-filled `slots` buffer
-                // is dropped here harmlessly (`MaybeUninit<E>` has no
-                // Drop).
+            // A valid counter is in 1..2*table_size. Tiny public table
+            // shapes can leave unvisited spread slots, so reject their zero
+            // counters. Reject oversized counters before the lookup: otherwise
+            // they could select another table log's precomputed transition.
+            if next_state == 0 || next_state >= 2 * table_size_u32 {
+                let num_bits = if next_state == 0 {
+                    accuracy_log + 1
+                } else {
+                    accuracy_log.wrapping_sub(next_state.ilog2() as u8)
+                };
                 return Err(FSETableError::TableInvariantViolation {
                     prob: self.symbol_probabilities[symbol as usize],
                     symbol,
-                    num_bits: nb,
+                    num_bits,
                     accuracy_log,
                 });
             }
-            // `next_state << nb` ranges [table_size, 2*table_size - (1 << nb)];
-            // subtracting `table_size` gives `new_state ∈ [0, table_size - 1]`
-            // which fits u16 for any `accuracy_log <= 16`
-            // (`ENTRY_MAX_ACCURACY_LOG`). The wire format caps
-            // `accuracy_log` at `FSE_MAX_TABLELOG = 9` for sequence
-            // tables, well below the u16 bound. Use normal
-            // subtraction (not wrapping_sub) so the
-            // implicit-overflow debug_assert catches any future
-            // formula bug instead of silently producing a
-            // malformed entry.
-            let new_state_u32 = (next_state << nb) - table_size_u32;
-            let entry = E::from_raw(new_state_u32 as u16, symbol, nb);
+            let (new_state, nb) = if cfg!(target_arch = "x86_64") && CAP <= 512 {
+                // table_size <= CAP <= 512 and next_state < 2*table_size,
+                // so this index is at most 2047. Other architectures keep
+                // the arithmetic builder until the lookup is measured there.
+                let packed = FSE_TRANSITIONS[2 * table_size + next_state as usize];
+                (packed as u16, (packed >> 16) as u8)
+            } else {
+                // The range guard proves floor(log2(next_state)) <= accuracy_log.
+                let nb = accuracy_log - next_state.ilog2() as u8;
+                debug_assert!(nb <= accuracy_log);
+                (((next_state << nb) - table_size_u32) as u16, nb)
+            };
+            let entry = E::from_raw(new_state, symbol, nb);
             // Fused enrich: write the sequence meta in the same pass
             // instead of re-walking the finished table. `from_raw`
             // zero-inits the meta fields, so the no-meta arms match
@@ -1228,7 +1222,7 @@ const ACC_LOG_OFFSET: u8 = 5;
 const ENTRY_MAX_ACCURACY_LOG: u8 = 16;
 
 fn highest_bit_set(x: u32) -> u32 {
-    assert!(x > 0);
+    debug_assert!(x > 0);
     u32::BITS - x.leading_zeros()
 }
 

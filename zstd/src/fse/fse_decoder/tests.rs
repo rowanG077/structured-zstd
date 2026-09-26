@@ -141,3 +141,46 @@ fn is_populated_detects_built_rle_table() {
         "an RLE table (decode_len = 1, accuracy_log = 0) must report populated"
     );
 }
+
+#[test]
+fn tiny_probability_tables_with_unvisited_slots_are_rejected() {
+    // Logs 1 and 3 produce an even spread step. An unused slot contains the
+    // default symbol zero, whose probability is zero in these distributions.
+    // The builder must report an error before applying ilog2 to that counter.
+    for log in [1, 3] {
+        let mut table = FSETable::new(1);
+        assert!(matches!(
+            table.build_from_probabilities(log, &[0, 1 << log]),
+            Err(FSETableError::TableInvariantViolation { .. })
+        ));
+        assert!(!table.is_populated());
+    }
+}
+
+#[test]
+fn precomputed_transitions_match_arithmetic_tables() {
+    // CAP controls which implementation is used. Keep the probabilities and
+    // actual table size identical to compare all rows, including zero-bit
+    // transitions, low-probability symbols, and counters near 2*table_size.
+    for log in 4..=9 {
+        let size = 1i32 << log;
+        for probs in [
+            alloc::vec![size],
+            alloc::vec![1, size - 1],
+            alloc::vec![-1, 0, size - 2, 1],
+            alloc::vec![size / 2, size / 4, size / 4],
+        ] {
+            let mut lookup = FSETableImpl::<Entry, 512>::new(255);
+            let mut arithmetic = FSETableImpl::<Entry, 1024>::new(255);
+            lookup.build_from_probabilities(log, &probs).unwrap();
+            arithmetic.build_from_probabilities(log, &probs).unwrap();
+            for (a, b) in lookup.decode().iter().zip(arithmetic.decode()) {
+                assert_eq!(
+                    (a.symbol, a.new_state, a.num_bits),
+                    (b.symbol, b.new_state, b.num_bits),
+                    "log={log}, probabilities={probs:?}",
+                );
+            }
+        }
+    }
+}
