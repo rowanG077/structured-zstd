@@ -119,70 +119,13 @@ fn prefetch_stride_x86<const HINT: i32>(slice: &[u8]) {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn prefetch_slice_impl_l1(slice: &[u8]) {
-    prefetch_stride_aarch64::<true>(slice);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn prefetch_first_line_l1_impl(ptr: *const u8) {
-    use core::arch::asm;
-    unsafe {
-        asm!(
-            "prfm pldl1keep, [{ptr}]",
-            ptr = in(reg) ptr,
-            options(nostack, preserves_flags, readonly)
-        );
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn prefetch_slice_impl_t1(slice: &[u8]) {
-    prefetch_stride_aarch64::<false>(slice);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn prefetch_stride_aarch64<const L1: bool>(slice: &[u8]) {
-    use core::arch::asm;
-    const CACHE_LINE: usize = 64;
-    const MAX_LINES: usize = 4;
-
-    if slice.len() < CACHE_LINE {
-        return;
-    }
-
-    let line_count = slice.len().div_ceil(CACHE_LINE).min(MAX_LINES);
-    let base = slice.as_ptr();
-    for i in 0..line_count {
-        let ptr = unsafe { base.add(i * CACHE_LINE) };
-        if L1 {
-            unsafe {
-                asm!(
-                    "prfm pldl1keep, [{ptr}]",
-                    ptr = in(reg) ptr,
-                    options(nostack, preserves_flags, readonly)
-                )
-            };
-        } else {
-            unsafe {
-                asm!(
-                    "prfm pldl2keep, [{ptr}]",
-                    ptr = in(reg) ptr,
-                    options(nostack, preserves_flags, readonly)
-                )
-            };
-        }
-    }
-}
-
+// AArch64's `_prefetch` is still an unstable Rust intrinsic
+// (`stdarch_aarch64_prefetch`, issue 117217), including at our Rust 1.92
+// minimum. Cache hints are optional, so AArch64 and other platforms without
+// a stable prefetch intrinsic use the no-op fallback below.
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", target_feature = "sse"),
-    target_arch = "aarch64",
 )))]
 #[inline(always)]
 fn prefetch_slice_impl_l1(_slice: &[u8]) {}
@@ -190,7 +133,6 @@ fn prefetch_slice_impl_l1(_slice: &[u8]) {}
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", target_feature = "sse"),
-    target_arch = "aarch64",
 )))]
 #[inline(always)]
 fn prefetch_first_line_l1_impl(_ptr: *const u8) {}
@@ -198,7 +140,6 @@ fn prefetch_first_line_l1_impl(_ptr: *const u8) {}
 #[cfg(not(any(
     target_arch = "x86_64",
     all(target_arch = "x86", target_feature = "sse"),
-    target_arch = "aarch64",
 )))]
 #[inline(always)]
 fn prefetch_slice_impl_t1(_slice: &[u8]) {}

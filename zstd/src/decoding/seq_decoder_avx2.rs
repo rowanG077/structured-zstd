@@ -490,18 +490,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
             of_dec.update_state_fast(&mut br);
         }
 
-        // SAFETY: alignment-only asm, no memory or register clobbers.
-        unsafe {
-            core::arch::asm!(
-                ".p2align 6",
-                "nop",
-                ".p2align 5",
-                "nop",
-                ".p2align 3",
-                options(nomem, nostack, preserves_flags)
-            );
-        }
-
         let mut pipeline_err: Option<DecompressBlockError> = None;
         for i in ADVANCE..num_sequences {
             let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
