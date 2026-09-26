@@ -1,5 +1,74 @@
 use super::x86::{copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride};
 
+/// Exercise the actual AVX2 macro, including literal overshoot that the match
+/// immediately overwrites. A byte-at-a-time oracle handles overlapping matches
+/// independently of the SIMD copy implementation.
+#[cfg(all(feature = "std", feature = "kernel-avx2"))]
+#[test]
+fn avx2_sequence_copy_stride_and_tail_boundaries() {
+    if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2")) {
+        return;
+    }
+
+    #[target_feature(enable = "bmi2,avx2")]
+    unsafe fn run(
+        out: &mut [u8],
+        cap: usize,
+        literals: &[u8],
+        ll: usize,
+        ml: usize,
+        offset: usize,
+    ) {
+        let written = super::exec_sequence_avx2_inline_at!(
+            out.as_mut_ptr(),
+            80,
+            cap,
+            cap - super::MAX_WILDCOPY_OVERSHOOT,
+            literals.as_ptr(),
+            ll,
+            offset,
+            ml
+        )
+        .unwrap();
+        assert_eq!(written, ll + ml);
+    }
+
+    for ll in [0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 127] {
+        let literals: alloc::vec::Vec<u8> = (0..ll + crate::WILDCOPY_OVERLENGTH)
+            .map(|i| (i * 17 + 5) as u8)
+            .collect();
+        for ml in [
+            3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 65, 129, 1023, 1024, 1025, 2048, 8193,
+        ] {
+            for offset in [1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 64, 80] {
+                let mut expected: alloc::vec::Vec<u8> = (0..80).map(|i| (i * 7) as u8).collect();
+                expected.extend_from_slice(&literals[..ll]);
+                for _ in 0..ml {
+                    expected.push(expected[expected.len() - offset]);
+                }
+                for slack in [0, 1, 15, 30, 31, 32, 63] {
+                    let cap = expected.len() + slack;
+                    let mut out = alloc::vec![0xCD; cap + 32];
+                    out[..80].copy_from_slice(&expected[..80]);
+                    // SAFETY: the CPU supports both features; literals carry
+                    // initialized read slack, output has the requested cap,
+                    // and each offset reaches the initialized 80-byte prefix.
+                    unsafe { run(&mut out, cap, &literals, ll, ml, offset) };
+                    assert_eq!(
+                        &out[..expected.len()],
+                        &expected,
+                        "ll={ll}, ml={ml}, offset={offset}, slack={slack}"
+                    );
+                    assert!(
+                        out[cap..].iter().all(|&b| b == 0xCD),
+                        "write past cap: ll={ll}, ml={ml}, offset={offset}, slack={slack}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn copy16_copies_exactly_16_bytes() {
     let src: [u8; 16] = [

@@ -117,13 +117,16 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 /// # Safety
 /// The enclosing function must carry `target_feature(bmi2,avx2)`, `base` must be
 /// the start of a linear output valid for writes through `cap`, and `lit_src`
-/// must be readable for the literal length rounded up to 16.
+/// must be readable for at least 16 bytes, and for the literal length rounded
+/// up to 32 when it exceeds 16. Callers provide 32 bytes of initialized slack
+/// after the literals. The match offset must be nonzero and reach only bytes
+/// already written in the prefix or by this sequence's literals.
 #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 macro_rules! exec_sequence_avx2_inline_at {
     ($base:expr, $tail:expr, $cap:expr, $cap_w:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
         use crate::decoding::exec_sequence_inline::x86::{
-            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+            copy16, copy32_avx2, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
             wildcopy_overlap_8byte_stride,
         };
         let lit_length_v: usize = $lit_length;
@@ -167,9 +170,22 @@ macro_rules! exec_sequence_avx2_inline_at {
                 let op_lit = base.add(tail);
                 let op_match = base.add(tail + lit_length_v);
                 let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
-                copy16(op_lit, lit_src_v);
+                // Literals carry the same 32-byte trailing slack as the
+                // destination, so the AVX2 stride is sound here too. Keep
+                // the SSE2 copy for the common tiny literal run; once a run
+                // crosses 16 bytes, a 32-byte head + 32-byte tail halves the
+                // number of load/store pairs versus the 16-byte copier.
                 if lit_length_v > 16 {
-                    wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                    copy32_avx2(op_lit, lit_src_v);
+                    if lit_length_v > 32 {
+                        wildcopy_no_overlap_avx2(
+                            op_lit.add(32),
+                            lit_src_v.add(32),
+                            lit_length_v - 32,
+                        );
+                    }
+                } else {
+                    copy16(op_lit, lit_src_v);
                 }
                 if offset_v >= 32 {
                     wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
