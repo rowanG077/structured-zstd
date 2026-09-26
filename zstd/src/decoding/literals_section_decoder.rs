@@ -1,5 +1,15 @@
-//! This module contains the decompress_literals function, used to take a
-//! parsed literals header and a source and decompress it.
+//! Decode a parsed literals section into a reusable output buffer.
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        feature = "kernel-bmi2",
+        feature = "kernel-avx2",
+        feature = "kernel-vbmi2"
+    )
+))]
+#[path = "literals_x2.rs"]
+mod literals_x2;
 
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
 use super::buffer_backend::WILDCOPY_OVERLENGTH;
@@ -251,7 +261,7 @@ fn decompress_literals(
         // past.
         #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
         CpuKernelTag::Neon => {
-            decompress_literals_impl::<NeonKernel>(section, scratch, dict, source, target)
+            decompress_literals_impl::<NeonKernel, false>(section, scratch, dict, source, target)
         }
         #[cfg(all(
             target_arch = "aarch64",
@@ -259,9 +269,11 @@ fn decompress_literals(
             any(feature = "std", target_feature = "sve"),
         ))]
         CpuKernelTag::Sve => {
-            decompress_literals_impl::<SveKernel>(section, scratch, dict, source, target)
+            decompress_literals_impl::<SveKernel, false>(section, scratch, dict, source, target)
         }
-        _ => decompress_literals_impl::<ScalarKernel>(section, scratch, dict, source, target),
+        _ => {
+            decompress_literals_impl::<ScalarKernel, false>(section, scratch, dict, source, target)
+        }
     }
 }
 
@@ -274,7 +286,7 @@ unsafe fn decompress_literals_avx2(
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Avx2Kernel>(section, scratch, dict, source, target)
+    decompress_literals_impl::<Avx2Kernel, true>(section, scratch, dict, source, target)
 }
 
 #[cfg(all(
@@ -289,7 +301,7 @@ unsafe fn decompress_literals_bmi2(
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Bmi2Kernel>(section, scratch, dict, source, target)
+    decompress_literals_impl::<Bmi2Kernel, true>(section, scratch, dict, source, target)
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
@@ -301,10 +313,10 @@ unsafe fn decompress_literals_vbmi2(
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Vbmi2Kernel>(section, scratch, dict, source, target)
+    decompress_literals_impl::<Vbmi2Kernel, true>(section, scratch, dict, source, target)
 }
 
-fn decompress_literals_impl<K: CpuKernel>(
+fn decompress_literals_impl<K: CpuKernel, const BMI2: bool>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
     dict: Option<&Dictionary>,
@@ -334,6 +346,8 @@ fn decompress_literals_impl<K: CpuKernel>(
     match section.ls_type {
         LiteralsSectionType::Compressed => {
             //read Huffman tree description
+            scratch.x2_decode.clear();
+            scratch.x2_uniform_bits = 0;
             bytes_read += scratch.table.build_decoder(source)?;
             // Copy-on-write "write": a freshly-built table is local, so the
             // section no longer reads the shared dictionary's Huffman table.
@@ -348,6 +362,28 @@ fn decompress_literals_impl<K: CpuKernel>(
     }
 
     let source = &source[bytes_read as usize..];
+
+    // Two-symbol decoding needs enough output to amortize its larger table.
+    // When at least half its entries contain only one symbol, its wider
+    // loads and variable output steps outweigh the saved lookups. Use the
+    // actual code-length distribution: compressed bytes per literal can be
+    // misleading when common short codes coexist with rare long codes.
+    let use_x2 = cfg!(target_arch = "x86_64")
+        && BMI2
+        && num_streams == 4
+        && (regen >= 16384 || (regen >= 512 && !scratch.x2_decode.is_empty()))
+        && (!scratch.x2_decode.is_empty() || scratch.huf_table(dict).x2_pair_coverage() > 1024);
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(
+            feature = "kernel-bmi2",
+            feature = "kernel-avx2",
+            feature = "kernel-vbmi2"
+        )
+    ))]
+    if use_x2 {
+        scratch.prepare_x2(dict);
+    }
 
     // Copy-on-write source: the dictionary's Huffman table (zero-copy) on a
     // Treeless section that still reads `Dict`, else the locally-built one.
@@ -532,10 +568,36 @@ fn decompress_literals_impl<K: CpuKernel>(
                     )
                 };
             }
-            match max_num_bits {
-                10 => run!(10),
-                11 => run!(11),
-                _ => run!(0),
+            // Choose the two-symbol kernel before entering the X1 helper,
+            // keeping its table and selector out of the X1 register allocation.
+            if use_x2 {
+                #[cfg(all(
+                    target_arch = "x86_64",
+                    any(
+                        feature = "kernel-bmi2",
+                        feature = "kernel-avx2",
+                        feature = "kernel-vbmi2"
+                    )
+                ))]
+                if burst_eligible {
+                    run_4stream_bmi2::<K>(
+                        &mut decoders,
+                        &mut brs,
+                        target_ptr,
+                        scratch.x2_decode.as_slice(),
+                        &mut cursors,
+                        cursor_burst_ceil,
+                        symbols_per_burst,
+                        max_num_bits,
+                        scratch.x2_uniform_bits,
+                    );
+                }
+            } else {
+                match max_num_bits {
+                    10 => run!(10),
+                    11 => run!(11),
+                    _ => run!(0),
+                }
             }
         }
 
@@ -909,66 +971,65 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel, const TABLE_BITS: u8>(
     let bytes_per_iter_upper = (8 + burst_bits as usize) / 8;
     let mut any_iter = false;
 
-    while c0 <= cursor_burst_ceil {
-        let min_ip = ip0.min(ip1).min(ip2).min(ip3);
-        if min_ip < bytes_per_iter_upper {
-            break;
-        }
-        any_iter = true;
-
-        // Dispatch on the compile-time symbol count so the dominant cases get
-        // a fully-unrolled body. `symbols_per_burst` is loop-invariant, so
-        // loop-unswitching hoists the match out of the `while`; each arm
-        // expands `burst!` to straight-line scalar code. SPB=5 covers
-        // `max_num_bits ∈ {10, 11}` (the large-alphabet, literal-heavy case
-        // that dominates decode cost); 6 covers {8, 9}, 7 covers {7}. Rarer
-        // small-max tables fall through to the dynamic loop.
-        match symbols_per_burst {
-            5 => burst!(5),
-            6 => burst!(6),
-            7 => burst!(7),
-            _ => {
-                for _ in 0..symbols_per_burst {
-                    decode1!(b0, c0);
-                    decode1!(b1, c1);
-                    decode1!(b2, c2);
-                    decode1!(b3, c3);
+    // Select the fixed burst width once. Keeping this match outside the
+    // saturated loop avoids re-testing it for every group of symbols.
+    macro_rules! run_burst_loop {
+        ($body:expr) => {{
+            while c0 <= cursor_burst_ceil {
+                let min_ip = ip0.min(ip1).min(ip2).min(ip3);
+                if min_ip < bytes_per_iter_upper {
+                    break;
                 }
-            }
-        }
+                any_iter = true;
+                $body;
 
-        // Reload all 4 streams (upstream zstd `HUF_4X1_RELOAD_STREAM`).
-        //
-        // SAFETY:
-        //   * `ip[s] - nb_bytes >= 0`: the `min_ip >= bytes_per_iter_upper`
-        //     gate at outer-loop entry guarantees `nb_bytes <= bytes_per_iter_upper`
-        //     (where `nb_bytes = ctz(bits[s]) >> 3` and `ctz <= padding_skip
-        //     + burst_bits <= 8 + burst_bits`, the bound `bytes_per_iter_upper`
-        //     pre-computes).
-        //   * `ip[s] + 8 <= source.len()`: `BitReaderReversed::new()`
-        //     starts with `bits_consumed = 64`, so the very first
-        //     `get_bits(1)` in the per-stream padding-skip loop
-        //     above triggers `refill()`. For `source.len() >= 8` that
-        //     fast-path establishes `brs[s].index = source.len() - 8`;
-        //     `init_state`'s subsequent `get_bits(max_num_bits)`
-        //     stays inside the same 8-byte window without another
-        //     refill (only `bits_consumed` advances). The
-        //     `refill_slow` path used for shorter streams leaves
-        //     `index = 0` (with the partial bytes left-shifted into
-        //     `bit_container`), making `min_ip = 0 <
-        //     bytes_per_iter_upper` so the burst loop exits via
-        //     `any_iter = false` BEFORE reaching this reload (the
-        //     writeback below is unreachable on `source.len() < 8`).
-        //     Within the loop, `ip[s]` only decreases via the line
-        //     above this comment, preserving the upper bound.
-        // Reload order `(MEM_read64 | 1) << nb_bits` (NOT `(.. << nb_bits) | 1`):
-        // the sentinel must land at bit `nb_bits` so the next reload's `ctz`
-        // accumulates the sub-byte phase; resetting it to bit 0 loses the
-        // phase between reloads.
-        reload1!(b0, ip0, src0);
-        reload1!(b1, ip1, src1);
-        reload1!(b2, ip2, src2);
-        reload1!(b3, ip3, src3);
+                // Reload all 4 streams (upstream zstd `HUF_4X1_RELOAD_STREAM`).
+                //
+                // SAFETY:
+                //   * `ip[s] - nb_bytes >= 0`: the `min_ip >= bytes_per_iter_upper`
+                //     gate at outer-loop entry guarantees `nb_bytes <= bytes_per_iter_upper`
+                //     (where `nb_bytes = ctz(bits[s]) >> 3` and `ctz <= padding_skip
+                //     + burst_bits <= 8 + burst_bits`, the bound `bytes_per_iter_upper`
+                //     pre-computes).
+                //   * `ip[s] + 8 <= source.len()`: `BitReaderReversed::new()`
+                //     starts with `bits_consumed = 64`, so the very first
+                //     `get_bits(1)` in the per-stream padding-skip loop
+                //     above triggers `refill()`. For `source.len() >= 8` that
+                //     fast-path establishes `brs[s].index = source.len() - 8`;
+                //     `init_state`'s subsequent `get_bits(max_num_bits)`
+                //     stays inside the same 8-byte window without another
+                //     refill (only `bits_consumed` advances). The
+                //     `refill_slow` path used for shorter streams leaves
+                //     `index = 0` (with the partial bytes left-shifted into
+                //     `bit_container`), making `min_ip = 0 <
+                //     bytes_per_iter_upper` so the burst loop exits via
+                //     `any_iter = false` BEFORE reaching this reload (the
+                //     writeback below is unreachable on `source.len() < 8`).
+                //     Within the loop, `ip[s]` only decreases via the line
+                //     above this comment, preserving the upper bound.
+                // Reload order `(MEM_read64 | 1) << nb_bits` (NOT `(.. << nb_bits) | 1`):
+                // the sentinel must land at bit `nb_bits` so the next reload's `ctz`
+                // accumulates the sub-byte phase; resetting it to bit 0 loses the
+                // phase between reloads.
+                reload1!(b0, ip0, src0);
+                reload1!(b1, ip1, src1);
+                reload1!(b2, ip2, src2);
+                reload1!(b3, ip3, src3);
+            }
+        }};
+    }
+    match symbols_per_burst {
+        5 => run_burst_loop!(burst!(5)),
+        6 => run_burst_loop!(burst!(6)),
+        7 => run_burst_loop!(burst!(7)),
+        _ => run_burst_loop!({
+            for _ in 0..symbols_per_burst {
+                decode1!(b0, c0);
+                decode1!(b1, c1);
+                decode1!(b2, c2);
+                decode1!(b3, c3);
+            }
+        }),
     }
 
     // Commit cursors to the caller's array (the drain phase reads them)
@@ -1016,3 +1077,94 @@ mod zerocopy_robustness_tests;
 
 #[cfg(test)]
 mod burst_gate_tests;
+
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        feature = "kernel-bmi2",
+        feature = "kernel-avx2",
+        feature = "kernel-vbmi2"
+    )
+))]
+/// Decode one or two symbols per lookup on BMI2. The caller has already
+/// validated the table, stream headers and output segments, and resolved BMI2
+/// before entering this decoder. No runtime feature detection occurs here.
+///
+/// Each chunk admits at most `input_bytes / 7` and `output_bytes / 10`
+/// iterations. One iteration decodes five entries per stream, each consuming
+/// at most eleven bits and producing at most two bytes. Its sentinel starts
+/// at bit 0..=8 and therefore remains set after at most 55 shifts; `ctz / 8`
+/// advances the input by at most seven bytes. Each reload stays within its
+/// original stream allocation. Even when an entry emits only one symbol, its
+/// two-byte store stays within the ten bytes reserved for this iteration.
+///
+/// # Safety
+/// The same allocation, table and cursor invariants as
+/// `run_4stream_burst_loop` apply. The current CPU must support BMI2, and
+/// `x2` must be the 2048-entry table built by `HuffmanScratch::prepare_x2`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run_4stream_bmi2<K: CpuKernel>(
+    decoders: &mut [HuffmanDecoder<'_>; 4],
+    brs: &mut [BitReaderReversed<'_, K>; 4],
+    target: *mut u8,
+    x2: &[u32],
+    cursors: &mut [usize; 4],
+    cursor_burst_ceil: usize,
+    symbols_per_burst: usize,
+    max_num_bits: u8,
+    uniform_bits: u8,
+) {
+    debug_assert_eq!(x2.len(), 2048);
+    debug_assert!((1..=11).contains(&max_num_bits));
+    let ends: [usize; 4] =
+        core::array::from_fn(|i| cursors[i] + (cursor_burst_ceil + symbols_per_burst - cursors[0]));
+    let mut args = literals_x2::Args {
+        ip: core::array::from_fn(|i| unsafe { brs[i].source.as_ptr().add(brs[i].index) }),
+        op: core::array::from_fn(|i| unsafe { target.add(cursors[i]) }),
+        bits: core::array::from_fn(|i| {
+            (brs[i].bit_container | 1) << (brs[i].bits_consumed - max_num_bits)
+        }),
+        table: x2.as_ptr(),
+        iters: 0,
+    };
+    let mut any = false;
+    loop {
+        let mut input_budget = usize::MAX;
+        let mut output_budget = usize::MAX;
+        for i in 0..4 {
+            let available = unsafe { args.ip[i].offset_from(brs[i].source.as_ptr()) as usize };
+            input_budget = input_budget.min(available / 7);
+            output_budget = output_budget.min((ends[i] - cursors[i]) / 10);
+        }
+        args.iters = input_budget.min(output_budget);
+        if args.iters == 0 {
+            break;
+        }
+        any = true;
+        // SAFETY: the two budgets above cover every read and write in all
+        // `iters` iterations, including the reload after the last entry.
+        unsafe {
+            if uniform_bits == 4 {
+                literals_x2::decode::<true, 8>(&mut args);
+            } else if uniform_bits == 5 {
+                literals_x2::decode::<true, 10>(&mut args);
+            } else if max_num_bits <= 5 {
+                literals_x2::decode::<true, 0>(&mut args);
+            } else {
+                literals_x2::decode::<false, 0>(&mut args);
+            }
+        }
+        for i in 0..4 {
+            cursors[i] = unsafe { args.op[i].offset_from(target) as usize };
+        }
+    }
+    if !any {
+        return;
+    }
+    for i in 0..4 {
+        brs[i].index = unsafe { args.ip[i].offset_from(brs[i].source.as_ptr()) as usize };
+        brs[i].bit_container = u64::from_le(unsafe { args.ip[i].cast::<u64>().read_unaligned() });
+        brs[i].bits_consumed = args.bits[i].trailing_zeros() as u8 + max_num_bits;
+        decoders[i].state = args.bits[i] >> (64 - max_num_bits);
+    }
+}

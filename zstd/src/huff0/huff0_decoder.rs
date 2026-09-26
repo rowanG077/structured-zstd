@@ -195,19 +195,34 @@ impl HuffmanTable {
         }
     }
 
+    /// Number of eleven-bit prefixes containing two complete codes. A pair
+    /// of lengths `a` and `b` occupies `2^(11-a-b)` entries in the X2 table;
+    /// different code pairs occupy disjoint prefixes. The existing rank counts
+    /// therefore give exact coverage without constructing the larger table.
+    pub(crate) fn x2_pair_coverage(&self) -> u16 {
+        let mut covered = 0u32;
+        for first in 1..11 {
+            let first_count = self.bit_ranks[first];
+            for second in 1..=11 - first {
+                covered += (first_count * self.bit_ranks[second]) << (11 - first - second);
+            }
+        }
+        // Every covered prefix is distinct and the full table has 2048 slots.
+        debug_assert!(covered <= 2048);
+        covered as u16
+    }
+
     /// Completely empty the table then repopulate as a replica
     /// of `other`.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
-        // Copy ONLY the decode-time state. `weights` / `bits` /
-        // `rank scratch and the weight-decoding `fse_table` are build-time
-        // scratch (repopulated when a block carries a new HUF table); the
-        // literal-decode hot path reads only `packed_decode` + `max_num_bits`
-        // + `state_mask`. Skipping the rest mirrors the upstream zstd copying just the
-        // HUF decode table per frame, not the full build workspace.
+        // Copy decode-time state, including the code-length histogram used
+        // to select X1 or X2. Weights, per-symbol lengths and their FSE table
+        // remain build scratch, repopulated when another table is parsed.
         self.packed_decode.extend_from_slice(&other.packed_decode);
         self.max_num_bits = other.max_num_bits;
         self.state_mask = other.state_mask;
+        self.bit_ranks = other.bit_ranks;
     }
 
     /// Completely empty the table of all data.

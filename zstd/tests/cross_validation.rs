@@ -217,6 +217,43 @@ fn cross_ffi_compress_rust_decompress_large_blocks() {
     assert_eq!(data, result, "ffi→rust multi-block roundtrip failed");
 }
 
+/// Verify the literal-heavy benchmark shapes against C-generated frames,
+/// including a shorter next frame through the same direct decoder context.
+#[test]
+fn cross_ffi_compress_rust_decompress_x2_literal_shapes() {
+    use structured_zstd::decoding::FrameDecoder;
+
+    let mut decoder = FrameDecoder::new();
+    for shape in [16u32, 32, 64, 90, 95] {
+        let mut state = if shape <= 64 {
+            0x517cc1b727220a95u64
+        } else {
+            0x85dbcf079257u64
+        };
+        let data: Vec<u8> = (0..1_048_576)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if shape <= 64 {
+                    ((state >> 56) % u64::from(shape)) as u8
+                } else if state >> 56 < u64::from(shape * 256 / 100) {
+                    ((state >> 32) % 16) as u8
+                } else {
+                    (16 + (state >> 32) % 240) as u8
+                }
+            })
+            .collect();
+        for input in [data.as_slice(), &data[..8192]] {
+            let compressed = zstd::bulk::compress(input, 3).unwrap();
+            let mut output = vec![0; input.len()];
+            let written = decoder.decode_all(&compressed, &mut output).unwrap();
+            assert_eq!(written, input.len());
+            assert_eq!(output, input, "shape={shape}, length={}", input.len());
+        }
+    }
+}
+
 /// Cross-validate Rust compress (seed=100, 512KB) → C FFI decompress for the
 /// same Huffman-heavy multi-block input used in roundtrip_multi_block_large_literals.
 #[test]

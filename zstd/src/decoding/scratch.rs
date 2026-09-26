@@ -136,10 +136,7 @@ impl<'o, 'p> Workspace for DirectScratch<'o, 'p> {
 impl<B: BufferBackend> DecoderScratch<B> {
     pub fn new(window_size: usize) -> DecoderScratch<B> {
         DecoderScratch {
-            huf: HuffmanScratch {
-                table: HuffmanTable::new(),
-                table_source: TableSource::Local,
-            },
+            huf: HuffmanScratch::new(),
             fse: FSEScratch {
                 offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
                 literal_lengths: AlignedFSETable::new(MAX_LITERAL_LENGTH_CODE),
@@ -296,6 +293,15 @@ impl<B: BufferBackend> DecoderScratch<B> {
 #[derive(Clone)]
 pub struct HuffmanScratch {
     pub table: HuffmanTable,
+    /// Lazy two-symbol decode table. Empty means invalid; clearing preserves
+    /// capacity for the next compressed block and every source change clears it.
+    /// Each entry stores symbols in bits 0..=15 and `nbits | (length << 6)`
+    /// in bits 16..=23. Bits 24..=31 are zero. A wrapping u64 shift ignores
+    /// the length flags, so both consumed bits and output length use one byte.
+    pub(crate) x2_decode: Vec<u32>,
+    /// Nonzero only if every original table entry has exactly this code
+    /// length. Allows a constant shift independent of the dependent lookup.
+    pub(crate) x2_uniform_bits: u8,
     /// Copy-on-write source for the literals Huffman table, mirroring the
     /// sequence-FSE treatment in [`FSEScratch`]: `Dict` reads the shared
     /// dictionary's table by reference (no copy), `Local` reads the
@@ -313,16 +319,77 @@ impl HuffmanScratch {
     pub fn new() -> HuffmanScratch {
         HuffmanScratch {
             table: HuffmanTable::new(),
+            x2_decode: Vec::new(),
+            x2_uniform_bits: 0,
             table_source: TableSource::Local,
         }
     }
 
-    /// Heap bytes owned by this scratch: the locally-built Huffman table.
+    /// Heap bytes owned by this scratch: the local Huffman table and X2 cache.
     /// A `Dict`-sourced table is read through a shared, ref-counted handle
     /// (not owned here), so it is excluded, mirroring upstream not charging
     /// `refDDict` memory to the decode context.
     pub fn heap_bytes(&self) -> usize {
-        self.table.heap_bytes()
+        self.table.heap_bytes() + self.x2_decode.capacity() * core::mem::size_of::<u32>()
+    }
+
+    /// Materialize the two-symbol table only when the code-length distribution
+    /// and payload size justify it. Treeless blocks reuse the completed table.
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(
+            feature = "kernel-bmi2",
+            feature = "kernel-avx2",
+            feature = "kernel-vbmi2"
+        )
+    ))]
+    pub(crate) fn prepare_x2(&mut self, dict: Option<&Dictionary>) {
+        if !self.x2_decode.is_empty() {
+            return;
+        }
+        let table = match self.table_source {
+            TableSource::Local => &self.table,
+            TableSource::Dict => &expect_dict(dict).huf.table,
+        };
+        let bits = table.max_num_bits;
+        debug_assert!((1..=11).contains(&bits));
+        let shift = 11 - bits;
+        // The expanded table indexes every original entry, including rare
+        // symbols. Checking the actual code length is exact, independent of
+        // the distribution observed in the current compressed payload.
+        let mut uniform_bits = bits;
+        self.x2_decode.reserve(2048);
+        for (index, slot) in self.x2_decode.spare_capacity_mut()[..2048]
+            .iter_mut()
+            .enumerate()
+        {
+            let first = table.packed_decode[index >> shift];
+            let first_bits = first as u8;
+            if first_bits != bits {
+                uniform_bits = 0;
+            }
+            let second = table.packed_decode[((index << first_bits) & 2047) >> shift];
+            debug_assert!((1..=11).contains(&first_bits));
+            debug_assert!((1..=11).contains(&(second as u8)));
+            let total_bits = first_bits + second as u8;
+            let entry = if total_bits <= 11 {
+                u32::from(first >> 8)
+                    | u32::from(second & 0xff00)
+                    | (u32::from(total_bits) << 16)
+                    | (2 << 22)
+            } else {
+                u32::from(first >> 8) | (u32::from(first_bits) << 16) | (1 << 22)
+            };
+            debug_assert!((1..=11).contains(&((entry >> 16) & 0x3f)));
+            debug_assert!((1..=2).contains(&(entry >> 22)));
+            slot.write(entry);
+        }
+        // SAFETY: all 2048 spare slots were initialized above. An earlier
+        // panic leaves the Vec empty, so no unwritten entries become visible.
+        unsafe {
+            self.x2_decode.set_len(2048);
+        }
+        self.x2_uniform_bits = uniform_bits;
     }
 
     /// Live Huffman literals table: the dictionary's (zero-copy) while the
@@ -343,11 +410,15 @@ impl HuffmanScratch {
         // The COW table-source must be re-armed every frame (a prior frame's
         // `Compressed` literals section may have flipped it to `Local`).
         self.table_source = TableSource::Dict;
+        self.x2_decode.clear();
+        self.x2_uniform_bits = 0;
     }
 
     /// Drop any dictionary attachment and revert to the local table.
     pub(crate) fn detach_dict(&mut self) {
         self.table_source = TableSource::Local;
+        self.x2_decode.clear();
+        self.x2_uniform_bits = 0;
     }
 
     /// Flip to the locally-built table (called after a `Compressed`
@@ -355,6 +426,8 @@ impl HuffmanScratch {
     #[inline]
     pub(crate) fn mark_table_local(&mut self) {
         self.table_source = TableSource::Local;
+        self.x2_decode.clear();
+        self.x2_uniform_bits = 0;
     }
 
     /// Snapshot the live (COW-resolved) Huffman table into `self` as an

@@ -1871,6 +1871,50 @@ fn every_cpu_tier_decodes_a_dictionary_frame_the_same_way() {
     }
 }
 
+/// Replay independent wire fixtures through every available x64 tier, reusing
+/// the context for a shorter frame after a larger one. Normal dispatch only
+/// exercises the widest tier, so it cannot catch a BMI2-only regression.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[test]
+fn every_x64_tier_reuses_context_across_corpus_frames() {
+    use crate::cpu_kernel::CpuKernelTag;
+    let mut kernels = alloc::vec![CpuKernelTag::Scalar];
+    #[cfg(feature = "kernel-sse")]
+    kernels.push(CpuKernelTag::Sse2);
+    #[cfg(feature = "kernel-bmi2")]
+    if std::is_x86_feature_detected!("bmi2") {
+        kernels.push(CpuKernelTag::Bmi2);
+    }
+    #[cfg(feature = "kernel-avx2")]
+    if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("avx2") {
+        kernels.push(CpuKernelTag::Avx2);
+    }
+    let native = crate::cpu_kernel::detect_cpu_kernel();
+    if !kernels.contains(&native) {
+        kernels.push(native);
+    }
+    let fixtures: &[(&[u8], &[u8])] = &[
+        (
+            include_bytes!("../../../decodecorpus_files/z000033.zst"),
+            include_bytes!("../../../decodecorpus_files/z000033"),
+        ),
+        (
+            include_bytes!("../../../decodecorpus_files/z000000.zst"),
+            include_bytes!("../../../decodecorpus_files/z000000"),
+        ),
+    ];
+    for kernel in kernels {
+        let mut decoder = FrameDecoder::new();
+        decoder.decode_with_kernel_for_tests(kernel);
+        for &(frame, expected) in fixtures {
+            let mut output = alloc::vec![0u8; expected.len() + crate::WILDCOPY_OVERLENGTH];
+            let written = decoder.decode_all(frame, &mut output).unwrap();
+            assert_eq!(written, expected.len(), "{kernel:?}");
+            assert_eq!(&output[..written], expected, "{kernel:?}");
+        }
+    }
+}
+
 #[test]
 fn implausible_content_size_skips_eager_alloc_direct_path() {
     // Adversarial frame: a 1 KiB window (small ring) but a declared
